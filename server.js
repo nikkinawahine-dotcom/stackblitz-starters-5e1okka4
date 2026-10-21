@@ -139,12 +139,10 @@ app.post('/api/hud/vibrate', async (req, res) => {
 });
 
 // ==========================================
-// API ROUTE: GENERATE LOVENSE CONNECT LINK
-// ==========================================
 app.get('/api/hud/connect/:uuid', async (req, res) => {
   const wearer_uuid = req.params.uuid;
   try {
-    const response = await fetch('https://lovense.com', {
+    const response = await fetch('https://lovense-api.com', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
