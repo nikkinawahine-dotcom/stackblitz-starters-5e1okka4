@@ -138,6 +138,35 @@ app.post('/api/hud/vibrate', async (req, res) => {
   }
 });
 
+// ==========================================
+// API ROUTE: GENERATE LOVENSE CONNECT LINK
+// ==========================================
+app.get('/api/hud/connect/:uuid', async (req, res) => {
+  const wearer_uuid = req.params.uuid;
+  try {
+    const response = await fetch('https://lovense.com', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        token: process.env.LOVENSE_DEVELOPER_TOKEN,
+        uid: wearer_uuid,
+        uname: "SL_User",
+        type: "vcloud",
+        v: 2
+      })
+    });
+    const data = await response.json();
+    if (data.code === 200 && data.data && data.data.qrUrl) {
+      res.redirect(data.data.qrUrl);
+    } else {
+      res.status(400).send("Lovense API Error: " + JSON.stringify(data));
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Failed to get connection link from Lovense.");
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Database-connected server is listening on port ${PORT}`);
