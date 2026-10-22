@@ -138,28 +138,40 @@ app.post('/api/hud/vibrate', async (req, res) => {
   }
 });
 // ==========================================
-app.get('/api/hud/connect/:uuid', async (req, res) => {
+app.post('/api/hud/connect/:uuid', async (req, res) => {
   const wearer_uuid = req.params.uuid;
+  
+  // Check if token exists and clean hidden spaces
+  const devToken = process.env.LOVENSE_DEVELOPER_TOKEN ? process.env.LOVENSE_DEVELOPER_TOKEN.trim() : "";
+  console.log("Render Token Length:", devToken.length);
+  console.log("Render Token Cleaned Verification:", devToken.substring(0, 5) + "..." + devToken.substring(devToken.length - 5));
+
   try {
-    const response = await fetch('https://api.lovense-api.com/api/lan/v2/getQrCode', {
+    // Convert parameters to standard Form URL Encoded strings
+    const params = new URLSearchParams();
+    params.append('token', devToken);
+    params.append('uid', wearer_uuid);
+    params.append('uname', 'SL_User');
+    params.append('type', 'vcloud');
+    params.append('v', '2');
+
+    const response = await fetch('https://api.lovense-api.com/api/lan/getQrCode', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        token: process.env.LOVENSE_DEVELOPER_TOKEN,
-        uid: wearer_uuid,
-        uname: "SL_User",
-        type: "vcloud",
-        v: 2
-      })
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params
     });
+
     const rawText = await response.text();
-    console.log("Raw Lovense Response:", rawText);
+    console.log("Raw Lovense Gateway Response:", rawText);
+    
     const data = JSON.parse(rawText);
-    if (data.code === 200 && data.data && data.data.qrUrl) {
-      res.redirect(data.data.qrUrl);
-    } else {
-      res.status(400).send("Lovense API Error: " + JSON.stringify(data));
+    if (data.result === true || data.code === 200) {
+      const qrTarget = data.message || (data.data ? data.data.qrUrl : null);
+      if (qrTarget) {
+        return res.json({ success: true, qrUrl: qrTarget });
+      }
     }
+    res.status(400).send("Lovense API Error: " + rawText);
   } catch (err) {
     console.error("Server Route Error:", err);
     res.status(500).send("Failed to get connection link from Lovense.");
