@@ -173,14 +173,3 @@ app.post('/api/hud/connect/:uuid', async (req, res) => {
     res.status(500).send("Failed to get connection link from Lovense.");
   }
 });
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Database-connected server is listening on port ${PORT}`);
-});
-
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Database-connected server is listening on port ${PORT}`);
-});
