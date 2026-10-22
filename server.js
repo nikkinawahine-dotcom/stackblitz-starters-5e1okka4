@@ -141,13 +141,9 @@ app.post('/api/hud/vibrate', async (req, res) => {
 app.post('/api/hud/connect/:uuid', async (req, res) => {
   const wearer_uuid = req.params.uuid;
   
-  // Check if token exists and clean hidden spaces
   const devToken = process.env.LOVENSE_DEVELOPER_TOKEN ? process.env.LOVENSE_DEVELOPER_TOKEN.trim() : "";
-  console.log("Render Token Length:", devToken.length);
-  console.log("Render Token Cleaned Verification:", devToken.substring(0, 5) + "..." + devToken.substring(devToken.length - 5));
 
   try {
-    // Convert parameters to standard Form URL Encoded strings
     const params = new URLSearchParams();
     params.append('token', devToken);
     params.append('uid', wearer_uuid);
@@ -155,7 +151,7 @@ app.post('/api/hud/connect/:uuid', async (req, res) => {
     params.append('type', 'vcloud');
     params.append('v', '2');
 
-    const response = await fetch('https://api.lovense-api.com/api/lan/getQrCode', {
+    const response = await fetch('https://lovense-api.com', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: params
@@ -165,8 +161,8 @@ app.post('/api/hud/connect/:uuid', async (req, res) => {
     console.log("Raw Lovense Gateway Response:", rawText);
     
     const data = JSON.parse(rawText);
-    if (data.result === true || data.code === 200) {
-      const qrTarget = data.message || (data.data ? data.data.qrUrl : null);
+    if (data.result === true || data.code === 0 || data.code === 200) {
+      const qrTarget = data.data ? data.data.qr : null;
       if (qrTarget) {
         return res.json({ success: true, qrUrl: qrTarget });
       }
@@ -177,6 +173,12 @@ app.post('/api/hud/connect/:uuid', async (req, res) => {
     res.status(500).send("Failed to get connection link from Lovense.");
   }
 });
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Database-connected server is listening on port ${PORT}`);
+});
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
