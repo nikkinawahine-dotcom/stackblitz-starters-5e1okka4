@@ -173,3 +173,7 @@ app.post('/api/hud/connect/:uuid', async (req, res) => {
     res.status(500).send("Failed to get connection link from Lovense.");
   }
 });
+
+app.listen(process.env.PORT || 3000, () => {
+  console.log("Bridge server listener active and ready.");
+});
