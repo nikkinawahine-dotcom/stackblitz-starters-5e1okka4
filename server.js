@@ -160,6 +160,11 @@ app.post('/api/hud/connect/:uuid', async (req, res) => {
     const rawText = await response.text();
     console.log("Raw Lovense Gateway Response:", rawText);
     
+    // Safety check: if Lovense responds with HTML, don't crash
+    if (rawText.trim().startsWith("<")) {
+      return res.status(400).send("Lovense Gateway returned HTML: " + rawText.substring(0, 200));
+    }
+
     const data = JSON.parse(rawText);
     if (data.result === true || data.code === 0 || data.code === 200) {
       const qrTarget = data.data ? data.data.qr : null;
