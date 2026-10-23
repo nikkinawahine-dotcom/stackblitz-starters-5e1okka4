@@ -219,11 +219,12 @@ app.get('/pair/:sl_uuid', (req, res) => {
       ctx.fillStyle = "#fff";
       ctx.fillRect(0, 0, 260, 260);
       ctx.drawImage(qrImg, 0, 0, 260, 260);
-      const size = 72;
+      const size = 220;
       const x = (260 - size) / 2;
       const y = (260 - size) / 2;
       if (logo.complete && logo.naturalWidth) {
         ctx.save();
+        ctx.globalAlpha = 0.38;
         ctx.beginPath();
         ctx.arc(130, 130, size / 2, 0, Math.PI * 2);
         ctx.clip();
