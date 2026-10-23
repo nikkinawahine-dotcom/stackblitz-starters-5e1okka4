@@ -4,6 +4,90 @@ const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const { Pool } = require('pg');
+const QRCode = require('qrcode');
+const jsQR = require('jsqr');
+const Jimp = require('jimp');
+
+const brandedQrs = new Map();
+
+function logoFilePath() {
+  const nested = path.join(__dirname, 'public', 'logo.png');
+  const root = path.join(__dirname, 'logo.png');
+  return fs.existsSync(nested) ? nested : root;
+}
+
+function circleMask(image) {
+  const w = image.bitmap.width;
+  const h = image.bitmap.height;
+  const r = Math.min(w, h) / 2;
+  const cx = w / 2;
+  const cy = h / 2;
+  image.scan(0, 0, w, h, function (x, y, idx) {
+    const dx = x - cx + 0.5;
+    const dy = y - cy + 0.5;
+    if (dx * dx + dy * dy > r * r) {
+      this.bitmap.data[idx + 3] = 0;
+    }
+  });
+  return image;
+}
+
+async function makeBrandedQr(lovenseQrUrl) {
+  const qrRes = await fetch(lovenseQrUrl);
+  const original = Buffer.from(await qrRes.arrayBuffer());
+  try {
+    const src = await Jimp.read(original);
+    const decoded = jsQR(
+      new Uint8ClampedArray(src.bitmap.data),
+      src.bitmap.width,
+      src.bitmap.height
+    );
+    if (!decoded || !decoded.data) {
+      console.error('Could not decode Lovense QR; using original image');
+      return original;
+    }
+
+    const generated = await QRCode.toBuffer(decoded.data, {
+      errorCorrectionLevel: 'H',
+      margin: 2,
+      width: 512,
+      color: { dark: '#000000', light: '#ffffff' }
+    });
+
+    const qr = await Jimp.read(generated);
+    const logoPath = logoFilePath();
+    if (!fs.existsSync(logoPath)) {
+      return generated;
+    }
+
+    const logo = await Jimp.read(logoPath);
+    const logoSize = Math.round(qr.bitmap.width * 0.2);
+    logo.cover(logoSize, logoSize);
+    circleMask(logo);
+
+    const ring = 14;
+    const badgeSize = logoSize + ring * 2;
+    const badge = new Jimp(badgeSize, badgeSize, 0x00000000);
+    const cx = badgeSize / 2;
+    badge.scan(0, 0, badgeSize, badgeSize, function (x, y, idx) {
+      const dx = x - cx + 0.5;
+      const dy = y - cx + 0.5;
+      if (dx * dx + dy * dy <= (badgeSize / 2) * (badgeSize / 2)) {
+        this.bitmap.data[idx] = 255;
+        this.bitmap.data[idx + 1] = 255;
+        this.bitmap.data[idx + 2] = 255;
+        this.bitmap.data[idx + 3] = 255;
+      }
+    });
+    badge.composite(logo, ring, ring);
+    const pos = Math.round((qr.bitmap.width - badgeSize) / 2);
+    qr.composite(badge, pos, pos);
+    return qr.getBufferAsync(Jimp.MIME_PNG);
+  } catch (err) {
+    console.error('Branded QR failed:', err);
+    return original;
+  }
+}
 
 const app = express();
 app.set('trust proxy', 1);
@@ -145,6 +229,8 @@ app.post('/api/hud/register', async (req, res) => {
       });
     }
 
+    brandedQrs.set(sl_uuid, await makeBrandedQr(qrData.data.qr));
+
     const pairingUrl = `${publicBase(req)}/pair/${encodeURIComponent(sl_uuid)}?qr=${encodeURIComponent(qrData.data.qr)}`;
 
     return res.json({
@@ -179,6 +265,15 @@ app.get('/api/hud/qr-proxy', async (req, res) => {
   }
 });
 
+app.get('/api/hud/branded-qr/:sl_uuid', (req, res) => {
+  const buf = brandedQrs.get(req.params.sl_uuid);
+  if (!buf) {
+    return res.status(404).send('QR expired. Touch the object again.');
+  }
+  res.set('Content-Type', 'image/png');
+  res.send(buf);
+});
+
 app.get('/pair/:sl_uuid', (req, res) => {
   const slUuid = req.params.sl_uuid;
   const qr = req.query.qr;
@@ -188,7 +283,8 @@ app.get('/pair/:sl_uuid', (req, res) => {
 
   const statusUrl = `/api/hud/status/${encodeURIComponent(slUuid)}`;
   const controlUrl = `/control/${encodeURIComponent(slUuid)}`;
-  const qrSrc = `/api/hud/qr-proxy?url=${encodeURIComponent(String(qr))}`;
+  const qrSrc = `/api/hud/branded-qr/${encodeURIComponent(slUuid)}`;
+  const fallbackSrc = `/api/hud/qr-proxy?url=${encodeURIComponent(String(qr))}`;
   res.type('html').send(`<!DOCTYPE html>
 <html>
 <head>
@@ -197,7 +293,7 @@ app.get('/pair/:sl_uuid', (req, res) => {
   <title>Link Lovense</title>
   <style>
     body { font-family: sans-serif; background: #111; color: #eee; text-align: center; padding: 24px; }
-    canvas { width: 260px; height: 260px; background: #fff; padding: 12px; border-radius: 8px; }
+    img { width: 260px; height: 260px; background: #fff; padding: 12px; border-radius: 8px; }
     #status { margin-top: 16px; font-size: 18px; }
     a { color: #ff7ad9; }
   </style>
@@ -205,46 +301,9 @@ app.get('/pair/:sl_uuid', (req, res) => {
 <body>
   <h1>Scan with Lovense Remote</h1>
   <p>Open Lovense Remote, use Scan QR, then wait until this page says connected.</p>
-  <canvas id="qr" width="260" height="260"></canvas>
+  <img id="qr" src="${qrSrc}" alt="Lovense QR code" onerror="this.onerror=null;this.src='${fallbackSrc}'">
   <p id="status">Waiting for scan…</p>
   <script>
-    const canvas = document.getElementById("qr");
-    const ctx = canvas.getContext("2d");
-    const qrImg = new Image();
-    const logo = new Image();
-    let loaded = 0;
-    function draw() {
-      loaded += 1;
-      if (loaded < 2) return;
-      ctx.fillStyle = "#fff";
-      ctx.fillRect(0, 0, 260, 260);
-      ctx.drawImage(qrImg, 0, 0, 260, 260);
-      const corner = 54;
-      const logoSize = 78;
-      const pad = 10;
-      const hole = logoSize + pad * 2;
-      ctx.beginPath();
-      ctx.arc(130, 130, hole / 2, 0, Math.PI * 2);
-      ctx.fillStyle = "#fff";
-      ctx.fill();
-      if (logo.complete && logo.naturalWidth) {
-        ctx.save();
-        ctx.beginPath();
-        ctx.arc(130, 130, logoSize / 2, 0, Math.PI * 2);
-        ctx.clip();
-        ctx.drawImage(logo, (260 - logoSize) / 2, (260 - logoSize) / 2, logoSize, logoSize);
-        ctx.restore();
-      }
-      ctx.drawImage(qrImg, 0, 0, corner, corner, 0, 0, corner, corner);
-      ctx.drawImage(qrImg, 260 - corner, 0, corner, corner, 260 - corner, 0, corner, corner);
-      ctx.drawImage(qrImg, 0, 260 - corner, corner, corner, 0, 260 - corner, corner, corner);
-    }
-    qrImg.onload = draw;
-    logo.onload = draw;
-    logo.onerror = draw;
-    qrImg.src = ${JSON.stringify(qrSrc)};
-    logo.src = "/logo.png";
-
     async function poll() {
       try {
         const r = await fetch(${JSON.stringify(statusUrl)});
