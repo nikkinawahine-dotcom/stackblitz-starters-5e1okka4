@@ -1,5 +1,7 @@
 require('dotenv').config();
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const { Pool } = require('pg');
 
@@ -7,6 +9,12 @@ const app = express();
 app.set('trust proxy', 1);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use(express.static('public'));
+app.get('/logo.png', (req, res) => {
+  const nested = path.join(__dirname, 'public', 'logo.png');
+  const root = path.join(__dirname, 'logo.png');
+  res.sendFile(fs.existsSync(nested) ? nested : root);
+});
 
 const db = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -50,20 +58,22 @@ function listToys(connection) {
   }));
 }
 
-async function sendLovenseCommand(connection, payload) {
-  if (!connection || !connection.domain || !connection.httpsPort) {
-    throw new Error('Lovense connection is missing domain or port.');
-  }
-  const url = `https://${connection.domain}:${connection.httpsPort}/command`;
-  const response = await fetch(url, {
+async function sendLovenseCommand(uid, payload) {
+  const response = await fetch('https://api.lovense-api.com/api/lan/v2/command', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-platform': PLATFORM_NAME
-    },
-    body: JSON.stringify(payload)
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      token: LOVENSE_TOKEN,
+      uid,
+      ...payload
+    })
   });
-  return response.json();
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    return { code: response.status, message: text };
+  }
 }
 
 async function getSession(slUuid) {
@@ -150,6 +160,25 @@ app.post('/api/hud/register', async (req, res) => {
   }
 });
 
+app.get('/api/hud/qr-proxy', async (req, res) => {
+  const src = String(req.query.url || '');
+  if (!/^https:\/\/([\w.-]+\.)?lovense\.com\//i.test(src)) {
+    return res.status(400).send('Invalid QR source.');
+  }
+  try {
+    const qrRes = await fetch(src);
+    if (!qrRes.ok) {
+      return res.status(502).send('Could not load QR image.');
+    }
+    const buf = Buffer.from(await qrRes.arrayBuffer());
+    res.set('Content-Type', qrRes.headers.get('content-type') || 'image/jpeg');
+    res.send(buf);
+  } catch (err) {
+    console.error(err);
+    res.status(502).send('Could not load QR image.');
+  }
+});
+
 app.get('/pair/:sl_uuid', (req, res) => {
   const slUuid = req.params.sl_uuid;
   const qr = req.query.qr;
@@ -159,6 +188,7 @@ app.get('/pair/:sl_uuid', (req, res) => {
 
   const statusUrl = `/api/hud/status/${encodeURIComponent(slUuid)}`;
   const controlUrl = `/control/${encodeURIComponent(slUuid)}`;
+  const qrSrc = `/api/hud/qr-proxy?url=${encodeURIComponent(String(qr))}`;
   res.type('html').send(`<!DOCTYPE html>
 <html>
 <head>
@@ -167,7 +197,7 @@ app.get('/pair/:sl_uuid', (req, res) => {
   <title>Link Lovense</title>
   <style>
     body { font-family: sans-serif; background: #111; color: #eee; text-align: center; padding: 24px; }
-    img { width: 260px; height: 260px; background: #fff; padding: 12px; border-radius: 8px; }
+    canvas { width: 260px; height: 260px; background: #fff; padding: 12px; border-radius: 8px; }
     #status { margin-top: 16px; font-size: 18px; }
     a { color: #ff7ad9; }
   </style>
@@ -175,9 +205,38 @@ app.get('/pair/:sl_uuid', (req, res) => {
 <body>
   <h1>Scan with Lovense Remote</h1>
   <p>Open Lovense Remote, use Scan QR, then wait until this page says connected.</p>
-  <img src="${String(qr).replace(/"/g, '')}" alt="Lovense QR code">
+  <canvas id="qr" width="260" height="260"></canvas>
   <p id="status">Waiting for scan…</p>
   <script>
+    const canvas = document.getElementById("qr");
+    const ctx = canvas.getContext("2d");
+    const qrImg = new Image();
+    const logo = new Image();
+    let loaded = 0;
+    function draw() {
+      loaded += 1;
+      if (loaded < 2) return;
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(0, 0, 260, 260);
+      ctx.drawImage(qrImg, 0, 0, 260, 260);
+      const size = 72;
+      const x = (260 - size) / 2;
+      const y = (260 - size) / 2;
+      if (logo.complete && logo.naturalWidth) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(130, 130, size / 2, 0, Math.PI * 2);
+        ctx.clip();
+        ctx.drawImage(logo, x, y, size, size);
+        ctx.restore();
+      }
+    }
+    qrImg.onload = draw;
+    logo.onload = draw;
+    logo.onerror = draw;
+    qrImg.src = ${JSON.stringify(qrSrc)};
+    logo.src = "/logo.png";
+
     async function poll() {
       try {
         const r = await fetch(${JSON.stringify(statusUrl)});
@@ -215,15 +274,7 @@ app.get('/api/hud/toys/:sl_uuid', async (req, res) => {
       return res.status(404).json({ error: "Toy is not connected." });
     }
 
-    let toys = listToys(session.connection);
-    try {
-      const live = await sendLovenseCommand(session.connection, { command: 'GetToys' });
-      if (live && live.data && live.data.toys) {
-        toys = listToys({ toys: live.data.toys });
-      }
-    } catch (err) {
-      console.error("GetToys refresh failed, using saved toy list:", err.message);
-    }
+    const toys = listToys(session.connection);
 
     return res.json({ toys });
   } catch (err) {
@@ -368,8 +419,8 @@ app.post('/api/hud/vibrate', async (req, res) => {
 
   try {
     const session = await getSession(wearer_uuid);
-    if (!session || session.status !== 'connected' || !session.connection) {
-      return res.status(404).json({ error: "Toy is not connected or session expired." });
+    if (!session || session.status !== 'connected') {
+      return res.status(404).json({ error: "Toy is not connected or session expired. Re-link the QR." });
     }
 
     const payload = stop
@@ -385,13 +436,24 @@ app.post('/api/hud/vibrate', async (req, res) => {
       payload.toy = toy_id;
     }
 
-    const commandData = await sendLovenseCommand(session.connection, payload);
-    const ok = commandData && (commandData.code === 200 || commandData.result === true);
-    return res.json({ success: !!ok, details: commandData });
+    const commandData = await sendLovenseCommand(wearer_uuid, payload);
+    const ok = commandData && (commandData.code === 200 || commandData.code === 0 || commandData.result === true);
+    if (!ok) {
+      return res.status(502).json({
+        error: commandData.message || "Lovense rejected the command.",
+        details: commandData
+      });
+    }
+    return res.json({ success: true, details: commandData });
   } catch (err) {
     console.error("Vibration execution error:", err);
-    res.status(500).json({ error: "Failed to transmit vibe command." });
+    res.status(500).json({ error: err.message || "Failed to transmit vibe command." });
   }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Database-connected server is listening on port ${PORT}`);
 });
 
 const PORT = process.env.PORT || 3000;
