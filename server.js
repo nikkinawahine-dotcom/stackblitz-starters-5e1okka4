@@ -218,19 +218,23 @@ app.get('/pair/:sl_uuid', (req, res) => {
       if (loaded < 2) return;
       ctx.fillStyle = "#fff";
       ctx.fillRect(0, 0, 260, 260);
-      ctx.drawImage(qrImg, 0, 0, 260, 260);
-      const size = 220;
-      const x = (260 - size) / 2;
-      const y = (260 - size) / 2;
       if (logo.complete && logo.naturalWidth) {
         ctx.save();
-        ctx.globalAlpha = 0.38;
         ctx.beginPath();
-        ctx.arc(130, 130, size / 2, 0, Math.PI * 2);
+        ctx.arc(130, 130, 128, 0, Math.PI * 2);
         ctx.clip();
-        ctx.drawImage(logo, x, y, size, size);
+        ctx.drawImage(logo, 0, 0, 260, 260);
+        ctx.fillStyle = "rgba(255,255,255,0.28)";
+        ctx.fill();
         ctx.restore();
       }
+      ctx.globalCompositeOperation = "multiply";
+      ctx.drawImage(qrImg, 0, 0, 260, 260);
+      ctx.globalCompositeOperation = "source-over";
+      const corner = 52;
+      ctx.drawImage(qrImg, 0, 0, corner, corner, 0, 0, corner, corner);
+      ctx.drawImage(qrImg, 260 - corner, 0, corner, corner, 260 - corner, 0, corner, corner);
+      ctx.drawImage(qrImg, 0, 260 - corner, corner, corner, 0, 260 - corner, corner, corner);
     }
     qrImg.onload = draw;
     logo.onload = draw;
