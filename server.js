@@ -1,17 +1,25 @@
 require('dotenv').config();
+const crypto = require('crypto');
 const express = require('express');
 const { Pool } = require('pg');
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Establish secure access parameters to cloud storage
 const db = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-// Primary validation pathway
+const LOVENSE_TOKEN = process.env.LOVENSE_DEVELOPER_TOKEN;
+const LOVENSE_KEY = process.env.LOVENSE_KEY;
+const LOVENSE_IV = process.env.LOVENSE_IV;
+
+function publicBase(req) {
+  return process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`;
+}
+
 app.get('/', async (req, res) => {
   try {
     const dbTest = await db.query('SELECT NOW()');
@@ -22,62 +30,162 @@ app.get('/', async (req, res) => {
   }
 });
 
-// ==========================================
-// API ROUTE: HUD REGISTER SESSION PATHWAY
-// ==========================================
+// HUD starts pairing: save the SL callback URL, ask Lovense for a QR, return a page the HUD can open.
 app.post('/api/hud/register', async (req, res) => {
-  const { sl_uuid, sl_http_url } = req.body;
+  const { sl_uuid, sl_http_url, sl_name } = req.body;
 
   if (!sl_uuid || !sl_http_url) {
     return res.status(400).json({ error: "Missing avatar UUID or HTTP URL data." });
   }
 
+  if (!LOVENSE_TOKEN) {
+    return res.status(500).json({ error: "LOVENSE_DEVELOPER_TOKEN is not set on the server." });
+  }
+
+  const utoken = crypto.randomBytes(16).toString('hex');
+
   try {
     await db.query(
-      `INSERT INTO active_sessions (sl_uuid, sl_http_url, status) 
-       VALUES ($1, $2, 'pending') 
-       ON CONFLICT (sl_uuid) DO UPDATE SET sl_http_url = $2, status = 'pending'`,
-      [sl_uuid, sl_http_url]
+      `INSERT INTO active_sessions (sl_uuid, sl_http_url, status, lovense_token)
+       VALUES ($1, $2, 'pending', $3)
+       ON CONFLICT (sl_uuid) DO UPDATE SET
+         sl_http_url = $2,
+         status = 'pending',
+         lovense_token = $3,
+         toys = NULL`,
+      [sl_uuid, sl_http_url, utoken]
     );
 
-    return res.json({ 
-      success: true, 
-      message: "Session registered in database. Ready for Lovense link!" 
+    const qrResponse = await fetch('https://api.lovense-api.com/api/lan/getQrCode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        token: LOVENSE_TOKEN,
+        uid: sl_uuid,
+        uname: sl_name || sl_uuid,
+        utoken,
+        v: 2
+      })
     });
-    
+
+    const qrData = await qrResponse.json();
+    if (!qrData.result || !qrData.data || !qrData.data.qr) {
+      console.error("Lovense getQrCode failed:", qrData);
+      return res.status(502).json({
+        error: "Lovense did not return a QR code.",
+        details: qrData.message || qrData
+      });
+    }
+
+    const pairingUrl = `${publicBase(req)}/pair/${encodeURIComponent(sl_uuid)}?qr=${encodeURIComponent(qrData.data.qr)}`;
+
+    return res.json({
+      success: true,
+      message: "Scan the QR code with Lovense Remote to link your toy.",
+      qr: qrData.data.qr,
+      pairing_url: pairingUrl
+    });
   } catch (err) {
     console.error("Database registration error:", err);
     res.status(500).json({ error: "Server encountered a database error during registration." });
   }
 });
 
-// ==========================================
-// API ROUTE: LOVENSE CLOUD WEBHOOK CALLBACK
-// ==========================================
+// Browser page opened from Second Life so the wearer can scan the QR.
+app.get('/pair/:sl_uuid', (req, res) => {
+  const slUuid = req.params.sl_uuid;
+  const qr = req.query.qr;
+  if (!qr) {
+    return res.status(400).send("Missing QR image. Ask the HUD to register again.");
+  }
+
+  const statusUrl = `/api/hud/status/${encodeURIComponent(slUuid)}`;
+  res.type('html').send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Link Lovense</title>
+  <style>
+    body { font-family: sans-serif; background: #111; color: #eee; text-align: center; padding: 24px; }
+    img { width: 260px; height: 260px; background: #fff; padding: 12px; border-radius: 8px; }
+    #status { margin-top: 16px; font-size: 18px; }
+  </style>
+</head>
+<body>
+  <h1>Scan with Lovense Remote</h1>
+  <p>Open Lovense Remote, use Scan QR, then wait until this page says connected.</p>
+  <img src="${String(qr).replace(/"/g, '')}" alt="Lovense QR code">
+  <p id="status">Waiting for scan…</p>
+  <script>
+    async function poll() {
+      try {
+        const r = await fetch(${JSON.stringify(statusUrl)});
+        const data = await r.json();
+        if (data.status === "connected") {
+          document.getElementById("status").textContent = "Connected! You can close this tab.";
+          return;
+        }
+      } catch (e) {}
+      setTimeout(poll, 2000);
+    }
+    poll();
+  </script>
+</body>
+</html>`);
+});
+
+app.get('/api/hud/status/:sl_uuid', async (req, res) => {
+  try {
+    const result = await db.query(
+      'SELECT status FROM active_sessions WHERE sl_uuid = $1',
+      [req.params.sl_uuid]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ status: 'unknown' });
+    }
+    return res.json({ status: result.rows[0].status });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Status lookup failed." });
+  }
+});
+
+// Lovense Remote posts here after the QR is scanned. Set this exact path as Callback URL in the Lovense developer dashboard.
 app.post('/api/webhook/lovense', async (req, res) => {
-  const { uid, token, status, toys } = req.body; 
+  const { uid, utoken, toys, domain, httpPort, httpsPort, wsPort, wssPort, platform, appType } = req.body;
 
   try {
-    const userCheck = await db.query('SELECT sl_http_url FROM active_sessions WHERE sl_uuid = \$1', [uid]);
-    
+    const userCheck = await db.query(
+      'SELECT sl_http_url, lovense_token FROM active_sessions WHERE sl_uuid = $1',
+      [uid]
+    );
+
     if (userCheck.rows.length === 0) {
       return res.status(404).send("User session not found in database.");
     }
-    
-    const sl_url = userCheck.rows[0].sl_http_url;
+
+    const session = userCheck.rows[0];
+    if (utoken && session.lovense_token && utoken !== session.lovense_token) {
+      return res.status(403).send("utoken mismatch.");
+    }
+
+    const connection = { toys, domain, httpPort, httpsPort, wsPort, wssPort, platform, appType };
 
     await db.query(
-      `UPDATE active_sessions 
-       SET lovense_token = $1, status = 'connected', toys = $2 
-       WHERE sl_uuid = $3`,
-      [token, JSON.stringify(toys), uid]
+      `UPDATE active_sessions
+       SET status = 'connected', toys = $1
+       WHERE sl_uuid = $2`,
+      [JSON.stringify(connection), uid]
     );
 
-    await fetch(sl_url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain' },
-      body: "CONNECTED|Successfully linked your Lovense toy!"
-    });
+    if (session.sl_http_url) {
+      await fetch(session.sl_http_url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: "CONNECTED|Successfully linked your Lovense toy!"
+      });
+    }
 
     res.sendStatus(200);
   } catch (err) {
@@ -86,95 +194,12 @@ app.post('/api/webhook/lovense', async (req, res) => {
   }
 });
 
-// ==========================================
-// API ROUTE: HUD TRIGGERS A VIBRATION COMMAND
-// ==========================================
+// Vibration is the next step. Left in place but not used for pairing.
 app.post('/api/hud/vibrate', async (req, res) => {
-  const { wearer_uuid, strength, duration } = req.body; 
-
-  if (!wearer_uuid || strength === undefined) {
-    return res.status(400).json({ error: "Missing wearer_uuid or strength level." });
-  }
-
-  try {
-    const userCheck = await db.query(
-      "SELECT lovense_token FROM active_sessions WHERE sl_uuid = \$1 AND status = 'connected'", 
-      [wearer_uuid]
-    );
-    
-    if (userCheck.rows.length === 0) {
-      return res.status(404).json({ error: "Toy is not connected or session expired." });
-    }
-
-    const targetToken = userCheck.rows[0].lovense_token;
-    const devToken = process.env.LOVENSE_DEVELOPER_TOKEN ? process.env.LOVENSE_DEVELOPER_TOKEN.trim() : "";
-
-    const commandResponse = await fetch('https://lovense.com', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        developerToken: devToken,
-        token: targetToken,
-        uid: wearer_uuid,
-        command: "Vibrate",
-        apiVer: 2,
-        params: {
-          vibrate: parseInt(strength),
-          time: parseInt(duration) || 5
-        }
-      })
-    });
-
-    const commandData = await commandResponse.json();
-    return res.json({ success: commandData.code === 200 });
-  } catch (err) {
-    console.error("Vibration execution error:", err);
-    res.status(500).json({ error: "Failed to transmit vibe command." });
-  }
+  res.status(501).json({ error: "Vibration is not wired up yet. Pairing first." });
 });
 
-// ==========================================
-// API ROUTE: INTERACTION GATEWAY HANDSHAKE (LSL LINK)
-// ==========================================
-app.post('/api/hud/connect/:uuid', async (req, res) => {
-  const wearer_uuid = req.params.uuid;
-  const devToken = process.env.LOVENSE_DEVELOPER_TOKEN ? process.env.LOVENSE_DEVELOPER_TOKEN.trim() : "";
-
-  try {
-    const params = new URLSearchParams();
-    params.append('token', devToken);
-    params.append('uid', wearer_uuid);
-    params.append('uname', 'SL_User');
-    params.append('type', 'vcloud');
-    params.append('v', '2');
-
-    const response = await fetch('https://lovense-api.com', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: params
-    });
-
-    const rawText = await response.text();
-    
-    if (rawText.trim().startsWith("<")) {
-      return res.status(400).send("Lovense Gateway returned HTML layout instead of raw parameters.");
-    }
-
-    const data = JSON.parse(rawText);
-    if (data.result === true || data.code === 0 || data.code === 200) {
-      const qrTarget = data.data ? data.data.qr : null;
-      if (qrTarget) {
-        // We directly pass the raw URL string back to the LSL engine to map it instantly
-        return res.status(200).send(qrTarget);
-      }
-    }
-    res.status(400).send("Gateway execution returned error data processing the token.");
-  } catch (err) {
-    console.error("Server Route Error:", err);
-    res.status(500).send("Failed to retrieve a solid token allocation pathway.");
-  }
-});
-
-app.listen(process.env.PORT || 3000, () => {
-  console.log("Bridge initialization stable and completely responsive.");
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Database-connected server is listening on port ${PORT}`);
 });
