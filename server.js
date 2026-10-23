@@ -106,6 +106,14 @@ const db = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+async function ensureSchema() {
+  await db.query(`ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS display_name TEXT`);
+  await db.query(`ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS shared BOOLEAN DEFAULT false`);
+  await db.query(`ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS vibe_strength INTEGER DEFAULT 0`);
+  await db.query(`ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS vibe_until TIMESTAMPTZ`);
+}
+ensureSchema().catch((err) => console.error('Schema update failed:', err));
+
 const LOVENSE_TOKEN = process.env.LOVENSE_DEVELOPER_TOKEN;
 const PLATFORM_NAME = process.env.LOVENSE_PLATFORM_NAME || 'HotHawaiianNights';
 
@@ -139,8 +147,24 @@ function listToys(connection) {
     id: toy.id,
     type: toy.name || 'toy',
     name: toy.nickName || toy.name || toy.id,
-    status: toy.status
+    status: toy.status,
+    battery: toy.battery === undefined || toy.battery === null || toy.battery === ''
+      ? null
+      : parseInt(toy.battery, 10)
   }));
+}
+
+async function toysForSession(session) {
+  let toys = listToys(session.connection);
+  try {
+    const live = await sendToyCommand(session.sl_uuid, session.connection, { command: 'GetToys' });
+    if (live && live.data && live.data.toys) {
+      toys = listToys({ toys: live.data.toys });
+    }
+  } catch (err) {
+    console.error('GetToys for titler failed:', err.message);
+  }
+  return toys;
 }
 
 function commandOk(data) {
@@ -222,7 +246,8 @@ async function sendToyCommand(uid, connection, payload) {
 
 async function getSession(slUuid) {
   const result = await db.query(
-    'SELECT sl_uuid, sl_http_url, status, toys FROM active_sessions WHERE sl_uuid = $1',
+    `SELECT sl_uuid, sl_http_url, status, toys, display_name, shared, vibe_strength, vibe_until
+     FROM active_sessions WHERE sl_uuid = $1`,
     [slUuid]
   );
   if (result.rows.length === 0) return null;
@@ -258,14 +283,16 @@ app.post('/api/hud/register', async (req, res) => {
 
   try {
     await db.query(
-      `INSERT INTO active_sessions (sl_uuid, sl_http_url, status, lovense_token)
-       VALUES ($1, $2, 'pending', $3)
+      `INSERT INTO active_sessions (sl_uuid, sl_http_url, status, lovense_token, display_name, shared)
+       VALUES ($1, $2, 'pending', $3, $4, false)
        ON CONFLICT (sl_uuid) DO UPDATE SET
          sl_http_url = $2,
          status = 'pending',
          lovense_token = $3,
-         toys = NULL`,
-      [sl_uuid, sl_http_url, utoken]
+         display_name = $4,
+         toys = NULL,
+         shared = false`,
+      [sl_uuid, sl_http_url, utoken, sl_name || sl_uuid]
     );
 
     const qrResponse = await fetch('https://api.lovense-api.com/api/lan/getQrCode', {
@@ -385,13 +412,99 @@ app.get('/api/hud/status/:sl_uuid', async (req, res) => {
   try {
     const session = await getSession(req.params.sl_uuid);
     if (!session) {
-      return res.status(404).json({ status: 'unknown' });
+      return res.status(404).json({ status: 'unknown', connected: false, toys: [] });
     }
-    return res.json({ status: session.status });
+    const connected = session.status === 'connected';
+    const until = session.vibe_until ? new Date(session.vibe_until).getTime() : 0;
+    const vibe = connected && until > Date.now() ? (parseInt(session.vibe_strength, 10) || 0) : 0;
+    return res.json({
+      status: session.status,
+      connected,
+      vibe,
+      toys: connected ? await toysForSession(session) : []
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Status lookup failed." });
   }
+});
+
+app.get('/api/hud/wearers', async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT sl_uuid, COALESCE(display_name, sl_uuid) AS display_name
+       FROM active_sessions
+       WHERE status = 'connected' AND shared = true
+       ORDER BY display_name`
+    );
+    return res.json({ wearers: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Wearer list lookup failed." });
+  }
+});
+
+app.post('/api/hud/share', async (req, res) => {
+  const { sl_uuid, shared } = req.body;
+  if (!sl_uuid) {
+    return res.status(400).json({ error: "Missing sl_uuid." });
+  }
+  try {
+    const result = await db.query(
+      `UPDATE active_sessions
+       SET shared = $2
+       WHERE sl_uuid = $1 AND status = 'connected'
+       RETURNING sl_uuid, shared`,
+      [sl_uuid, shared !== false]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Link your toy first, then share it." });
+    }
+    return res.json({ success: true, shared: result.rows[0].shared });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not update sharing." });
+  }
+});
+
+app.get('/control', (req, res) => {
+  res.type('html').send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Choose a partner</title>
+  <style>
+    body { font-family: sans-serif; background: #111; color: #eee; max-width: 420px; margin: 0 auto; padding: 24px; }
+    a { display: block; background: #ff4da6; color: #fff; text-decoration: none; padding: 14px; border-radius: 8px; margin: 8px 0; text-align: center; font-weight: bold; }
+    p { color: #ccc; }
+  </style>
+</head>
+<body>
+  <h1>Control a partner</h1>
+  <p>These avatars shared their linked toy.</p>
+  <div id="list">Loading…</div>
+  <script>
+    async function load() {
+      const el = document.getElementById("list");
+      try {
+        const r = await fetch("/api/hud/wearers");
+        const data = await r.json();
+        if (!data.wearers || !data.wearers.length) {
+          el.innerHTML = "<p>Nobody has shared a toy yet. The wearer should touch the object and choose Share.</p>";
+          return;
+        }
+        el.innerHTML = data.wearers.map(function (w) {
+          return '<a href="/control/' + encodeURIComponent(w.sl_uuid) + '">' + (w.display_name || w.sl_uuid) + '</a>';
+        }).join("");
+      } catch (e) {
+        el.textContent = "Could not load partners.";
+      }
+    }
+    load();
+  </script>
+</body>
+</html>`);
 });
 
 app.get('/api/hud/toys/:sl_uuid', async (req, res) => {
@@ -429,7 +542,7 @@ app.get('/control/:sl_uuid', (req, res) => {
 </head>
 <body>
   <h1>Toy controls</h1>
-  <p>This lists toys currently linked in Lovense Remote, the same way Connect does.</p>
+  <p>This controls the linked avatar's toy. <a href="/control" style="color:#ff7ad9">Choose a partner</a></p>
   <label for="toy">Toy</label>
   <select id="toy"><option value="">All connected toys</option></select>
   <label for="strength">Vibration 0–20: <span id="strengthVal">10</span></label>
@@ -573,6 +686,20 @@ app.post('/api/hud/vibrate', async (req, res) => {
         details: commandData
       });
     }
+
+    const strengthNow = stop ? 0 : (parseInt(strength, 10) || 0);
+    const seconds = stop ? 0 : (parseInt(duration, 10) || 5);
+    await db.query(
+      `UPDATE active_sessions
+       SET vibe_strength = $2,
+           vibe_until = CASE
+             WHEN $2 <= 0 THEN NOW()
+             ELSE NOW() + ($3 * INTERVAL '1 second')
+           END
+       WHERE sl_uuid = $1`,
+      [wearer_uuid, strengthNow, seconds]
+    );
+
     return res.json({ success: true, details: commandData });
   } catch (err) {
     console.error("Vibration execution error:", err);
