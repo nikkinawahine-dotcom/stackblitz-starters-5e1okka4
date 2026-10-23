@@ -1,6 +1,7 @@
 require('dotenv').config();
 const crypto = require('crypto');
 const fs = require('fs');
+const https = require('https');
 const path = require('path');
 const express = require('express');
 const { Pool } = require('pg');
@@ -142,6 +143,44 @@ function listToys(connection) {
   }));
 }
 
+function commandOk(data) {
+  return data && (data.code === 200 || data.code === 0 || data.result === true);
+}
+
+function postHttpsJson(url, headers, body) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const data = JSON.stringify(body);
+    const req = https.request({
+      hostname: u.hostname,
+      port: u.port || 443,
+      path: u.pathname,
+      method: 'POST',
+      rejectUnauthorized: false,
+      timeout: 8000,
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(data),
+        ...headers
+      }
+    }, (res) => {
+      let raw = '';
+      res.on('data', (chunk) => { raw += chunk; });
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(raw));
+        } catch (err) {
+          resolve({ code: res.statusCode, message: raw });
+        }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('Lovense Remote timed out')));
+    req.write(data);
+    req.end();
+  });
+}
+
 async function sendLovenseCommand(uid, payload) {
   const response = await fetch('https://api.lovense-api.com/api/lan/v2/command', {
     method: 'POST',
@@ -158,6 +197,27 @@ async function sendLovenseCommand(uid, payload) {
   } catch (err) {
     return { code: response.status, message: text };
   }
+}
+
+async function sendToyCommand(uid, connection, payload) {
+  const domain = connection && connection.domain;
+  const port = connection && (connection.httpsPort || connection.wssPort);
+  if (domain && port && !String(domain).includes('127-0-0-1')) {
+    try {
+      const lan = await postHttpsJson(
+        `https://${domain}:${port}/command`,
+        { 'X-platform': PLATFORM_NAME },
+        payload
+      );
+      if (commandOk(lan)) {
+        return lan;
+      }
+      console.error('LAN command rejected:', lan);
+    } catch (err) {
+      console.error('LAN command failed:', err.message);
+    }
+  }
+  return sendLovenseCommand(uid, payload);
 }
 
 async function getSession(slUuid) {
@@ -503,11 +563,13 @@ app.post('/api/hud/vibrate', async (req, res) => {
       payload.toy = toy_id;
     }
 
-    const commandData = await sendLovenseCommand(wearer_uuid, payload);
-    const ok = commandData && (commandData.code === 200 || commandData.code === 0 || commandData.result === true);
-    if (!ok) {
+    const commandData = await sendToyCommand(wearer_uuid, session.connection, payload);
+    if (!commandOk(commandData)) {
+      const offline = commandData && (commandData.code === 507 || /offline/i.test(String(commandData.message || '')));
       return res.status(502).json({
-        error: commandData.message || "Lovense rejected the command.",
+        error: offline
+          ? "Lovense Remote is asleep. Open Remote, keep the phone screen on, then vibrate again."
+          : (commandData.message || "Lovense rejected the command."),
         details: commandData
       });
     }
