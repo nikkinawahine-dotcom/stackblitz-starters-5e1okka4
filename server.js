@@ -4,6 +4,7 @@ const express = require('express');
 const { Pool } = require('pg');
 
 const app = express();
+app.set('trust proxy', 1);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -13,11 +14,69 @@ const db = new Pool({
 });
 
 const LOVENSE_TOKEN = process.env.LOVENSE_DEVELOPER_TOKEN;
-const LOVENSE_KEY = process.env.LOVENSE_KEY;
-const LOVENSE_IV = process.env.LOVENSE_IV;
+const PLATFORM_NAME = process.env.LOVENSE_PLATFORM_NAME || 'HotHawaiianNights';
 
 function publicBase(req) {
   return process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`;
+}
+
+function parseConnection(rowToys) {
+  if (!rowToys) return null;
+  if (typeof rowToys === 'string') {
+    try {
+      return JSON.parse(rowToys);
+    } catch (err) {
+      return null;
+    }
+  }
+  return rowToys;
+}
+
+function listToys(connection) {
+  if (!connection || !connection.toys) return [];
+  let toys = connection.toys;
+  if (typeof toys === 'string') {
+    try {
+      toys = JSON.parse(toys);
+    } catch (err) {
+      return [];
+    }
+  }
+  return Object.values(toys).map((toy) => ({
+    id: toy.id,
+    type: toy.name || 'toy',
+    name: toy.nickName || toy.name || toy.id,
+    status: toy.status
+  }));
+}
+
+async function sendLovenseCommand(connection, payload) {
+  if (!connection || !connection.domain || !connection.httpsPort) {
+    throw new Error('Lovense connection is missing domain or port.');
+  }
+  const url = `https://${connection.domain}:${connection.httpsPort}/command`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-platform': PLATFORM_NAME
+    },
+    body: JSON.stringify(payload)
+  });
+  return response.json();
+}
+
+async function getSession(slUuid) {
+  const result = await db.query(
+    'SELECT sl_uuid, sl_http_url, status, toys FROM active_sessions WHERE sl_uuid = $1',
+    [slUuid]
+  );
+  if (result.rows.length === 0) return null;
+  const row = result.rows[0];
+  return {
+    ...row,
+    connection: parseConnection(row.toys)
+  };
 }
 
 app.get('/', async (req, res) => {
@@ -30,7 +89,6 @@ app.get('/', async (req, res) => {
   }
 });
 
-// HUD starts pairing: save the SL callback URL, ask Lovense for a QR, return a page the HUD can open.
 app.post('/api/hud/register', async (req, res) => {
   const { sl_uuid, sl_http_url, sl_name } = req.body;
 
@@ -83,7 +141,8 @@ app.post('/api/hud/register', async (req, res) => {
       success: true,
       message: "Scan the QR code with Lovense Remote to link your toy.",
       qr: qrData.data.qr,
-      pairing_url: pairingUrl
+      pairing_url: pairingUrl,
+      control_url: `${publicBase(req)}/control/${encodeURIComponent(sl_uuid)}`
     });
   } catch (err) {
     console.error("Database registration error:", err);
@@ -91,7 +150,6 @@ app.post('/api/hud/register', async (req, res) => {
   }
 });
 
-// Browser page opened from Second Life so the wearer can scan the QR.
 app.get('/pair/:sl_uuid', (req, res) => {
   const slUuid = req.params.sl_uuid;
   const qr = req.query.qr;
@@ -100,6 +158,7 @@ app.get('/pair/:sl_uuid', (req, res) => {
   }
 
   const statusUrl = `/api/hud/status/${encodeURIComponent(slUuid)}`;
+  const controlUrl = `/control/${encodeURIComponent(slUuid)}`;
   res.type('html').send(`<!DOCTYPE html>
 <html>
 <head>
@@ -110,6 +169,7 @@ app.get('/pair/:sl_uuid', (req, res) => {
     body { font-family: sans-serif; background: #111; color: #eee; text-align: center; padding: 24px; }
     img { width: 260px; height: 260px; background: #fff; padding: 12px; border-radius: 8px; }
     #status { margin-top: 16px; font-size: 18px; }
+    a { color: #ff7ad9; }
   </style>
 </head>
 <body>
@@ -123,7 +183,7 @@ app.get('/pair/:sl_uuid', (req, res) => {
         const r = await fetch(${JSON.stringify(statusUrl)});
         const data = await r.json();
         if (data.status === "connected") {
-          document.getElementById("status").textContent = "Connected! You can close this tab.";
+          document.getElementById("status").innerHTML = 'Connected! <a href="${controlUrl}">Open toy controls</a>';
           return;
         }
       } catch (e) {}
@@ -137,27 +197,132 @@ app.get('/pair/:sl_uuid', (req, res) => {
 
 app.get('/api/hud/status/:sl_uuid', async (req, res) => {
   try {
-    const result = await db.query(
-      'SELECT status FROM active_sessions WHERE sl_uuid = $1',
-      [req.params.sl_uuid]
-    );
-    if (result.rows.length === 0) {
+    const session = await getSession(req.params.sl_uuid);
+    if (!session) {
       return res.status(404).json({ status: 'unknown' });
     }
-    return res.json({ status: result.rows[0].status });
+    return res.json({ status: session.status });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Status lookup failed." });
   }
 });
 
-// Lovense Remote posts here after the QR is scanned. Set this exact path as Callback URL in the Lovense developer dashboard.
+app.get('/api/hud/toys/:sl_uuid', async (req, res) => {
+  try {
+    const session = await getSession(req.params.sl_uuid);
+    if (!session || session.status !== 'connected') {
+      return res.status(404).json({ error: "Toy is not connected." });
+    }
+
+    let toys = listToys(session.connection);
+    try {
+      const live = await sendLovenseCommand(session.connection, { command: 'GetToys' });
+      if (live && live.data && live.data.toys) {
+        toys = listToys({ toys: live.data.toys });
+      }
+    } catch (err) {
+      console.error("GetToys refresh failed, using saved toy list:", err.message);
+    }
+
+    return res.json({ toys });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Toy list lookup failed." });
+  }
+});
+
+app.get('/control/:sl_uuid', (req, res) => {
+  const slUuid = req.params.sl_uuid;
+  res.type('html').send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lovense Controls</title>
+  <style>
+    body { font-family: sans-serif; background: #111; color: #eee; max-width: 420px; margin: 0 auto; padding: 24px; }
+    label, select, input, button { display: block; width: 100%; margin: 8px 0; font-size: 16px; }
+    select, input { padding: 8px; border-radius: 6px; border: 0; }
+    button { padding: 12px; border: 0; border-radius: 8px; background: #ff4da6; color: #fff; font-weight: bold; }
+    button.secondary { background: #444; }
+    #status { min-height: 24px; color: #9f9; }
+  </style>
+</head>
+<body>
+  <h1>Toy controls</h1>
+  <p>This lists toys currently linked in Lovense Remote, the same way Connect does.</p>
+  <label for="toy">Toy</label>
+  <select id="toy"><option value="">All connected toys</option></select>
+  <label for="strength">Vibration 0–20: <span id="strengthVal">10</span></label>
+  <input id="strength" type="range" min="0" max="20" value="10">
+  <label for="duration">Seconds</label>
+  <input id="duration" type="number" min="1" max="60" value="5">
+  <button id="vibrate">Vibrate</button>
+  <button id="stop" class="secondary">Stop</button>
+  <p id="status">Loading toys…</p>
+  <script>
+    const uuid = ${JSON.stringify(slUuid)};
+    const toySelect = document.getElementById("toy");
+    const strength = document.getElementById("strength");
+    const strengthVal = document.getElementById("strengthVal");
+    const duration = document.getElementById("duration");
+    const status = document.getElementById("status");
+    strength.oninput = () => strengthVal.textContent = strength.value;
+
+    async function loadToys() {
+      try {
+        const r = await fetch("/api/hud/toys/" + encodeURIComponent(uuid));
+        const data = await r.json();
+        if (!r.ok) {
+          status.textContent = data.error || "Could not load toys.";
+          return;
+        }
+        toySelect.innerHTML = '<option value="">All connected toys</option>';
+        (data.toys || []).forEach((toy) => {
+          const opt = document.createElement("option");
+          opt.value = toy.id;
+          opt.textContent = toy.name + " (" + toy.type + ")";
+          toySelect.appendChild(opt);
+        });
+        status.textContent = (data.toys && data.toys.length)
+          ? "Select a toy, then vibrate."
+          : "No toys reported yet. Keep Remote open and refresh.";
+      } catch (e) {
+        status.textContent = "Failed to load toys.";
+      }
+    }
+
+    async function sendCommand(extra) {
+      const body = Object.assign({
+        wearer_uuid: uuid,
+        strength: parseInt(strength.value, 10),
+        duration: parseInt(duration.value, 10) || 5,
+        toy_id: toySelect.value || undefined
+      }, extra);
+      const r = await fetch("/api/hud/vibrate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const data = await r.json();
+      status.textContent = data.error || (data.success ? "Command sent." : "Command failed.");
+    }
+
+    document.getElementById("vibrate").onclick = () => sendCommand({});
+    document.getElementById("stop").onclick = () => sendCommand({ stop: true });
+    loadToys();
+  </script>
+</body>
+</html>`);
+});
+
 app.post('/api/webhook/lovense', async (req, res) => {
   const { uid, utoken, toys, domain, httpPort, httpsPort, wsPort, wssPort, platform, appType } = req.body;
 
   try {
     const userCheck = await db.query(
-      'SELECT sl_http_url, lovense_token FROM active_sessions WHERE sl_uuid = $1',
+      'SELECT sl_http_url, lovense_token, status FROM active_sessions WHERE sl_uuid = $1',
       [uid]
     );
 
@@ -179,7 +344,7 @@ app.post('/api/webhook/lovense', async (req, res) => {
       [JSON.stringify(connection), uid]
     );
 
-    if (session.sl_http_url) {
+    if (session.sl_http_url && session.status !== 'connected') {
       await fetch(session.sl_http_url, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain' },
@@ -194,9 +359,39 @@ app.post('/api/webhook/lovense', async (req, res) => {
   }
 });
 
-// Vibration is the next step. Left in place but not used for pairing.
 app.post('/api/hud/vibrate', async (req, res) => {
-  res.status(501).json({ error: "Vibration is not wired up yet. Pairing first." });
+  const { wearer_uuid, strength, duration, toy_id, stop } = req.body;
+
+  if (!wearer_uuid) {
+    return res.status(400).json({ error: "Missing wearer_uuid." });
+  }
+
+  try {
+    const session = await getSession(wearer_uuid);
+    if (!session || session.status !== 'connected' || !session.connection) {
+      return res.status(404).json({ error: "Toy is not connected or session expired." });
+    }
+
+    const payload = stop
+      ? { command: 'Function', action: 'Stop', timeSec: 0, apiVer: 1 }
+      : {
+          command: 'Function',
+          action: `Vibrate:${parseInt(strength, 10) || 0}`,
+          timeSec: parseInt(duration, 10) || 5,
+          apiVer: 1
+        };
+
+    if (toy_id) {
+      payload.toy = toy_id;
+    }
+
+    const commandData = await sendLovenseCommand(session.connection, payload);
+    const ok = commandData && (commandData.code === 200 || commandData.result === true);
+    return res.json({ success: !!ok, details: commandData });
+  } catch (err) {
+    console.error("Vibration execution error:", err);
+    res.status(500).json({ error: "Failed to transmit vibe command." });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
