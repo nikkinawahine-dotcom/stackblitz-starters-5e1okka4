@@ -542,12 +542,12 @@ app.get('/control/:sl_uuid', (req, res) => {
 </head>
 <body>
   <h1>Toy controls</h1>
-  <p>Drag the slider. Strength changes while you move it. Keep Lovense Remote open.</p>
+  <p>Drag the slider. Strength eases as you move it, then stops when the seconds run out. Keep Lovense Remote open.</p>
   <label for="toy">Toy</label>
   <select id="toy"><option value="">All connected toys</option></select>
   <label for="strength">Vibration 0–20: <span id="strengthVal">0</span></label>
   <input id="strength" type="range" min="0" max="20" step="1" value="0">
-  <label for="duration">Timed burst, seconds</label>
+  <label for="duration">Seconds</label>
   <input id="duration" type="number" min="1" max="60" value="5">
   <button id="vibrate">Vibrate for those seconds</button>
   <button id="stop" class="secondary">Stop</button>
@@ -559,9 +559,50 @@ app.get('/control/:sl_uuid', (req, res) => {
     const strengthVal = document.getElementById("strengthVal");
     const duration = document.getElementById("duration");
     const status = document.getElementById("status");
-    let desired = null;
-    let lastSent = null;
+    let desired = 0;
+    let lastSent = 0;
     let inflight = false;
+    let resend = false;
+    let endsAt = 0;
+    let clock = null;
+
+    function allowedSeconds() {
+      const n = parseInt(duration.value, 10) || 5;
+      return Math.max(1, Math.min(60, n));
+    }
+
+    function remaining() {
+      if (!endsAt) return 0;
+      return Math.max(0, Math.ceil((endsAt - Date.now()) / 1000));
+    }
+
+    function stepToward(from, to) {
+      const diff = to - from;
+      if (diff === 0) return to;
+      const step = Math.min(4, Math.abs(diff));
+      return from + (diff > 0 ? step : -step);
+    }
+
+    function stopClock() {
+      if (clock) clearInterval(clock);
+      clock = null;
+      endsAt = 0;
+    }
+
+    function beginSession() {
+      if (endsAt > Date.now()) return;
+      endsAt = Date.now() + allowedSeconds() * 1000;
+      if (clock) clearInterval(clock);
+      clock = setInterval(() => {
+        if (remaining() > 0) return;
+        stopClock();
+        strength.value = "0";
+        strengthVal.textContent = "0";
+        desired = 0;
+        status.textContent = "Time is up.";
+        pump();
+      }, 250);
+    }
 
     async function postCommand(body) {
       const r = await fetch("/api/hud/vibrate", {
@@ -587,19 +628,24 @@ app.get('/control/:sl_uuid', (req, res) => {
     }
 
     async function pump() {
-      if (inflight || desired === null || desired === lastSent) return;
-      const level = desired;
+      if (inflight) return;
+      const left = desired === 0 ? 0 : remaining();
+      if (desired > 0 && left <= 0) return;
+      const level = resend ? desired : (desired === 0 ? 0 : stepToward(lastSent, desired));
+      const mustSend = resend || level !== lastSent;
+      resend = false;
+      if (!mustSend) return;
       inflight = true;
       try {
-        await postCommand(commandBody(level, 0));
+        await postCommand(commandBody(level, left));
         lastSent = level;
-        status.textContent = level === 0 ? "Stopped." : ("Strength " + level);
+        status.textContent = level === 0 ? "Stopped." : ("Strength " + desired + ", " + left + "s left");
       } catch (e) {
         status.textContent = e.message || "Command failed.";
         lastSent = level;
       } finally {
         inflight = false;
-        if (desired !== lastSent) pump();
+        if (lastSent !== desired) pump();
       }
     }
 
@@ -607,6 +653,8 @@ app.get('/control/:sl_uuid', (req, res) => {
       const level = parseInt(strength.value, 10) || 0;
       strengthVal.textContent = String(level);
       desired = level;
+      if (level > 0) beginSession();
+      else stopClock();
       pump();
     };
 
@@ -626,30 +674,27 @@ app.get('/control/:sl_uuid', (req, res) => {
           toySelect.appendChild(opt);
         });
         status.textContent = (data.toys && data.toys.length)
-          ? "Drag the slider to change strength."
+          ? "Drag the slider. It runs for the seconds shown, then stops."
           : "No toys reported yet. Keep Remote open and refresh.";
       } catch (e) {
         status.textContent = "Failed to load toys.";
       }
     }
 
-    document.getElementById("vibrate").onclick = async () => {
+    document.getElementById("vibrate").onclick = () => {
       const level = parseInt(strength.value, 10) || 0;
-      const seconds = parseInt(duration.value, 10) || 5;
       if (level === 0) {
         status.textContent = "Move the slider above 0 first.";
         return;
       }
-      try {
-        await postCommand(commandBody(level, seconds));
-        lastSent = level;
-        desired = level;
-        status.textContent = "Strength " + level + " for " + seconds + " seconds.";
-      } catch (e) {
-        status.textContent = e.message || "Command failed.";
-      }
+      stopClock();
+      desired = level;
+      resend = true;
+      beginSession();
+      pump();
     };
     document.getElementById("stop").onclick = () => {
+      stopClock();
       strength.value = "0";
       strengthVal.textContent = "0";
       desired = 0;
@@ -729,7 +774,7 @@ app.post('/api/hud/vibrate', async (req, res) => {
       : {
           command: 'Function',
           action: `Vibrate:${level}`,
-          timeSec: seconds,
+          timeSec: Math.max(1, seconds),
           apiVer: 1
         };
 
@@ -749,7 +794,7 @@ app.post('/api/hud/vibrate', async (req, res) => {
     }
 
     const strengthNow = stopNow ? 0 : level;
-    const holdSeconds = strengthNow === 0 ? 0 : (seconds === 0 ? 3600 : seconds);
+    const holdSeconds = strengthNow === 0 ? 0 : Math.max(1, seconds);
     await db.query(
       `UPDATE active_sessions
        SET vibe_strength = $2,
