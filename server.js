@@ -147,6 +147,7 @@ async function ensureSchema() {
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
   await db.query(`ALTER TABLE control_offers ADD COLUMN IF NOT EXISTS rate INTEGER DEFAULT 30`);
+  await db.query(`ALTER TABLE control_offers ADD COLUMN IF NOT EXISTS grant_token TEXT`);
   await db.query(`UPDATE control_grants
     SET seconds_left = GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (expires_at - NOW())))::int)
     WHERE seconds_left IS NULL`);
@@ -1750,6 +1751,59 @@ app.post('/api/hud/offer', async (req, res) => {
   }
 });
 
+app.get('/api/hud/pay-state', async (req, res) => {
+  const wearer = String(req.query.sl_uuid || '');
+  const hidden = { mode: 'hide', price: 0, offer_id: '', label: '', recipient_uuid: '', rate: 0 };
+  if (!wearer) return res.status(400).json({ error: "Missing avatar." });
+  try {
+    const session = await getSession(wearer);
+    if (!session || session.status !== 'connected') return res.json(hidden);
+    const pending = await db.query(
+      `SELECT id, recipient_uuid, price, seconds, rate
+       FROM control_offers
+       WHERE wearer_uuid = $1 AND status = 'pending'
+         AND created_at > NOW() - INTERVAL '15 minutes'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [wearer]
+    );
+    if (pending.rows.length) {
+      const offer = pending.rows[0];
+      return res.json({
+        mode: 'offer',
+        price: Number(offer.price),
+        offer_id: offer.id,
+        label: offerLabel(offer.seconds),
+        recipient_uuid: offer.recipient_uuid,
+        rate: Math.max(1, Number(offer.rate) || LINDENS_PER_MINUTE)
+      });
+    }
+    if (hudMode(session.hud_mode) !== 'hooker') return res.json(hidden);
+    const grant = await db.query(
+      `SELECT recipient_uuid, rate
+       FROM control_grants
+       WHERE wearer_uuid = $1 AND hud_mode = 'hooker'
+         AND recipient_uuid ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [wearer]
+    );
+    if (!grant.rows.length) return res.json(hidden);
+    const rate = Math.max(1, Number(grant.rows[0].rate) || LINDENS_PER_MINUTE);
+    return res.json({
+      mode: 'add',
+      price: rate,
+      offer_id: '',
+      label: '',
+      recipient_uuid: grant.rows[0].recipient_uuid,
+      rate
+    });
+  } catch (err) {
+    console.error("Pay state error:", err);
+    res.status(500).json({ error: "Could not read the open payment." });
+  }
+});
+
 app.post('/api/hud/offer/accept', async (req, res) => {
   const wearer = String(req.body.sl_uuid || '');
   const offerId = String(req.body.offer_id || '');
@@ -1777,10 +1831,10 @@ app.post('/api/hud/offer/accept', async (req, res) => {
     const token = crypto.randomBytes(18).toString('hex');
     await db.query(
       `INSERT INTO control_grants (token, wearer_uuid, recipient_uuid, recipient_name, sender_name, seconds_left, hud_mode, rate, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6, 'hooker', $7, NOW() + ($6 * INTERVAL '1 second'))`,
-      [token, wearer, recipient, offer.recipient_name, offer.sender_name, offer.seconds, Math.max(1, Number(offer.rate) || LINDENS_PER_MINUTE)]
+       VALUES ($1, $2, $3, $4, $5, $6::int, 'hooker', $7::int, NOW() + ($8::int * INTERVAL '1 second'))`,
+      [token, wearer, recipient, offer.recipient_name, offer.sender_name, Number(offer.seconds), Math.max(1, Number(offer.rate) || LINDENS_PER_MINUTE), Number(offer.seconds)]
     );
-    await db.query(`UPDATE control_offers SET status = 'paid' WHERE id = $1`, [offerId]);
+    await db.query(`UPDATE control_offers SET status = 'paid', grant_token = $2 WHERE id = $1`, [offerId, token]);
     return res.json({
       success: true,
       price: offer.price,
@@ -1826,7 +1880,8 @@ app.post('/api/hud/offer/extend', async (req, res) => {
       seconds_added: added,
       seconds_left: grantRemaining(row),
       label: offerLabel(added),
-      rate
+      rate,
+      control_url: `${publicBase(req)}/guest/${found.rows[0].token}`
     });
   } catch (err) {
     console.error("Offer extend error:", err);
@@ -1855,7 +1910,7 @@ app.post('/api/hud/offer/decline', async (req, res) => {
 app.get('/offer/:id', async (req, res) => {
   try {
     const found = await db.query(
-      `SELECT sender_name, seconds, price, rate, status, created_at
+      `SELECT sender_name, seconds, price, rate, status, created_at, wearer_uuid, recipient_uuid, grant_token
        FROM control_offers WHERE id = $1`,
       [String(req.params.id || '')]
     );
@@ -1863,18 +1918,30 @@ app.get('/offer/:id', async (req, res) => {
       return res.status(404).type('html').send(guestMessage("This offer is not open."));
     }
     const offer = found.rows[0];
+    let grantToken = offer.grant_token || '';
+    if (!grantToken && offer.status === 'paid') {
+      const grant = await db.query(
+        `SELECT token FROM control_grants
+         WHERE wearer_uuid = $1 AND recipient_uuid = $2 AND created_at >= $3
+         ORDER BY created_at DESC LIMIT 1`,
+        [offer.wearer_uuid, offer.recipient_uuid, offer.created_at]
+      );
+      grantToken = (grant.rows[0] && grant.rows[0].token) || '';
+    }
+    if (grantToken) return res.redirect(`/guest/${encodeURIComponent(grantToken)}`);
     const fresh = offer.status === 'pending' && (Date.now() - new Date(offer.created_at).getTime()) < 15 * 60 * 1000;
     const name = String(offer.sender_name || 'She').replace(/[&<>"]/g, '');
     const label = offerLabel(offer.seconds);
     const rate = Math.max(1, Number(offer.rate) || LINDENS_PER_MINUTE);
     const note = fresh
-      ? `Pay her collar L$${offer.price}. That pays her for this time.`
+      ? `Right-click the ball on her collar and choose Pay. L$${offer.price} pays her for this time. This page becomes the controls after payment.`
       : "This offer is closed.";
     res.type('html').send(`<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  ${fresh ? '<meta http-equiv="refresh" content="4">' : ''}
   <title>${name} — Hot Hawaiian Nights</title>
   <link href="https://fonts.googleapis.com/css2?family=Pacifico&display=swap" rel="stylesheet">
   <style>
