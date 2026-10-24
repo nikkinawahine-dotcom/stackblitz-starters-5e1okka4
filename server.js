@@ -148,11 +148,28 @@ async function ensureSchema() {
   )`);
   await db.query(`ALTER TABLE control_offers ADD COLUMN IF NOT EXISTS rate INTEGER DEFAULT 30`);
   await db.query(`ALTER TABLE control_offers ADD COLUMN IF NOT EXISTS grant_token TEXT`);
+  await db.query(`CREATE TABLE IF NOT EXISTS site_assets (
+    name TEXT PRIMARY KEY,
+    bytes BYTEA NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
   await db.query(`UPDATE control_grants
     SET seconds_left = GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (expires_at - NOW())))::int)
     WHERE seconds_left IS NULL`);
 }
 ensureSchema().catch((err) => console.error('Schema update failed:', err));
+
+app.get('/neon-sign.png', async (req, res, next) => {
+  try {
+    const found = await db.query(`SELECT bytes FROM site_assets WHERE name = 'neon-sign'`);
+    if (!found.rows[0]) return next();
+    res.set('Content-Type', 'image/png');
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.send(found.rows[0].bytes);
+  } catch (err) {
+    next();
+  }
+});
 
 const LOVENSE_TOKEN = process.env.LOVENSE_DEVELOPER_TOKEN;
 const PLATFORM_NAME = process.env.LOVENSE_PLATFORM_NAME || 'HotHawaiianNights';
@@ -281,11 +298,20 @@ function toyLine(toys) {
   }).join(' | ');
 }
 
+function toyListEntries(value) {
+  if (typeof value === 'string') {
+    try { return toyListEntries(JSON.parse(value)); } catch (err) { return []; }
+  }
+  if (Array.isArray(value)) return value;
+  if (value && typeof value === 'object') return Object.values(value);
+  return [];
+}
+
 function toysFromCallback(body) {
   if (!body || typeof body !== 'object') return null;
-  if (Array.isArray(body.toyList)) {
+  if (body.toyList != null) {
     const map = {};
-    for (const toy of body.toyList) {
+    for (const toy of toyListEntries(body.toyList)) {
       if (!toy || typeof toy !== 'object') continue;
       const id = toy.id || toy.toyId;
       if (!id) continue;
@@ -304,6 +330,7 @@ function toysFromCallback(body) {
         ...(battery == null ? {} : { battery })
       };
     }
+    if (!Object.keys(map).length) return null;
     return map;
   }
   return body.toys || null;
@@ -472,7 +499,13 @@ function readReportedToys(data) {
   return toys;
 }
 
+function localLovense(session) {
+  const domain = session && session.connection && session.connection.domain;
+  return Boolean(domain && String(domain).includes('127-0-0-1'));
+}
+
 function scheduleGetToys(session) {
+  if (localLovense(session)) return;
   const uid = session.sl_uuid;
   if (Date.now() - (getToysAt.get(uid) || 0) < 60000) return;
   getToysAt.set(uid, Date.now());
@@ -525,6 +558,10 @@ function stopBatteryWatch(uid) {
 
 function watchBattery(session) {
   if (!session || session.status !== 'connected' || !LOVENSE_TOKEN) return;
+  if (localLovense(session)) {
+    stopBatteryWatch(session.sl_uuid);
+    return;
+  }
   const existing = batteryWatchers.get(session.sl_uuid);
   if (existing && !existing.stopped) return;
   const watcher = { stopped: false, seen: new Set() };
@@ -684,6 +721,7 @@ async function pollBatterySocket(base, uid, watcher) {
 }
 
 async function readBatterySocket(uid, displayName, watcher) {
+  let delay = 15000;
   while (!watcher.stopped) {
     try {
       const tokenRes = await fetch('https://api.lovense-api.com/api/basicApi/getToken', {
@@ -718,9 +756,10 @@ async function readBatterySocket(uid, displayName, watcher) {
       }
     } catch (err) {
       if (!watcher.stopped) console.error('Battery watch failed:', err.message);
+      delay = String(err.message).includes('handshake') ? Math.min(delay * 2, 5 * 60 * 1000) : 15000;
     }
     if (watcher.stopped) return;
-    await new Promise((resolve) => setTimeout(resolve, 15000));
+    await new Promise((resolve) => setTimeout(resolve, delay));
   }
 }
 
@@ -2051,6 +2090,41 @@ app.get('/api/hud/toys/:sl_uuid', async (req, res) => {
   }
 });
 
+function hookerNeonSign() {
+  return `<aside class="neon-sign" aria-hidden="true"><img src="/neon-sign.png" alt=""></aside>`;
+}
+
+function ageGate() {
+  return `<div class="age-gate" id="ageGate" role="dialog" aria-modal="true" aria-labelledby="ageTitle">
+    <div class="age-card">
+      <h2 id="ageTitle">HOT HAWAIIAN NIGHTS</h2>
+      <p>You must be 18 or older to enter.</p>
+      <div class="age-actions">
+        <button type="button" id="ageEnter">Enter</button>
+        <button type="button" id="ageExit">Exit</button>
+      </div>
+    </div>
+  </div>
+  <script>
+    (function () {
+      var enter = document.getElementById("ageEnter");
+      var exit = document.getElementById("ageExit");
+      if (!enter || !exit) return;
+      enter.addEventListener("click", function () {
+        try { sessionStorage.setItem("hhn-age-ok", "1"); } catch (e) {}
+        document.documentElement.classList.add("age-ok");
+        document.body.classList.remove("locked");
+        var gate = document.getElementById("ageGate");
+        if (gate) gate.remove();
+      });
+      exit.addEventListener("click", function () {
+        try { sessionStorage.removeItem("hhn-age-ok"); } catch (e) {}
+        location.replace("/left");
+      });
+    })();
+  </script>`;
+}
+
 function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSeconds, grantRunning, pageMode, payRate) {
   res.type('html').send(`<!DOCTYPE html>
 <html>
@@ -2064,7 +2138,7 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
   <style>
     body { font-family: sans-serif; background: #111; color: #eee; max-width: 420px; margin: 0 auto; padding: 24px; }
     .brand { display: flex; align-items: center; gap: 14px; margin: 0 0 8px; }
-    .brand img { width: 92px; height: 92px; border-radius: 50%; object-fit: cover; flex: none; box-shadow: 0 0 0 2px #f5b942; }
+    .brand > img { width: 92px; height: 92px; border-radius: 50%; object-fit: cover; flex: none; box-shadow: 0 0 0 2px #f5b942; }
     .brand h1 {
       margin: 0;
       font-family: "Pacifico", cursive;
@@ -2097,20 +2171,51 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
     .saved-row .remove { width: auto; background: #444; padding: 7px 10px; }
     #status { min-height: 24px; color: #9f9; }
     .sender { margin: 2px 0 0; font-size: 22px; font-weight: bold; color: #ffe08a; }
-    body.hooker { background: #160208; color: #ffe8ee; }
+    body.hooker { background: #070003; color: #ffe8ee; position: relative; }
     body.hooker button { background: #c8102e; }
     body.hooker button.secondary { background: #3a1018; }
     body.hooker .patterns button { background: #6b1024; }
     body.hooker .sender { color: #ff5a7a; letter-spacing: 0.04em; text-transform: uppercase; }
     body.hooker #grantLine, body.hooker .pattern-note { color: #ffc1cf; }
     body.hooker #status { color: #ffd0dc; }
+    body.hooker .brand { position: relative; min-height: 118px; padding-right: 132px; }
+    body.hooker .brand > img, body.hooker .brand h1 { position: relative; z-index: 1; }
+    body.hooker .neon-sign {
+      position: absolute; z-index: 0; top: 50%; right: -28px; width: 210px; margin: 0;
+      transform: translateY(-48%); pointer-events: none;
+    }
+    body.hooker .neon-sign img {
+      width: 100%; height: auto; display: block; border-radius: 0; box-shadow: none;
+      -webkit-mask-image: radial-gradient(ellipse 78% 82% at 58% 46%, #000 28%, transparent 72%);
+      mask-image: radial-gradient(ellipse 78% 82% at 58% 46%, #000 28%, transparent 72%);
+    }
+    html.age-ok .age-gate { display: none !important; }
+    body.hooker.locked > :not(.age-gate) { visibility: hidden; }
+    html.age-ok body.hooker.locked > :not(.age-gate) { visibility: visible; }
+    .age-gate {
+      position: fixed; inset: 0; z-index: 30; background: #070003; color: #ffe8ee;
+      display: flex; align-items: center; justify-content: center; padding: 24px; text-align: center;
+    }
+    .age-card { width: min(320px, 100%); }
+    .age-card h2 {
+      margin: 0 0 10px; font-family: "Pacifico", cursive; font-size: 32px; font-weight: 400;
+      background: linear-gradient(100deg, #ffe08a, #ff8a1e 40%, #ff3d6e 75%, #ff4df0);
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+    }
+    .age-card p { font-size: 16px; color: #ffe8ee; margin: 0 0 16px; }
+    .age-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .age-actions button { margin: 0; }
+    #ageExit { background: #3a1018; }
     [hidden] { display: none !important; }
   </style>
+${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("hhn-age-ok")==="1")document.documentElement.classList.add("age-ok")}catch(e){}</script>' : ""}
 </head>
-<body class="${guestToken && pageMode === 'hooker' ? 'hooker' : ''}">
+<body class="${guestToken && pageMode === 'hooker' ? 'hooker locked' : ''}">
+  ${guestToken && pageMode === 'hooker' ? ageGate() : ""}
   <header class="brand">
     <img src="/logo.png" alt="Hot Hawaiian Nights">
     <h1>HOT HAWAIIAN NIGHTS</h1>
+    ${guestToken && pageMode === 'hooker' ? hookerNeonSign() : ""}
   </header>
   <p id="senderName" class="sender"${ownerName ? "" : " hidden"}></p>
   <p id="intro">Move the slider. The motor stays on and the strength eases while you drag.</p>
@@ -3016,6 +3121,10 @@ function guestMessage(text) {
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Hot Hawaiian Nights</title></head><body style="font-family:sans-serif;background:#111;color:#eee;max-width:420px;margin:0 auto;padding:24px"><h1>Hot Hawaiian Nights</h1><p>${text}</p></body></html>`;
 }
 
+app.get('/left', (req, res) => {
+  res.type('html').send(guestMessage("You left. You must be 18 or older to enter."));
+});
+
 app.get('/control/:sl_uuid', (req, res) => {
   sendControlPage(res, req.params.sl_uuid, "", 0, "");
 });
@@ -3044,6 +3153,32 @@ async function newestPendingUid() {
   return pending.rows[0] && pending.rows[0].sl_uuid;
 }
 
+async function uidForToyCallback(body) {
+  const domain = body.domain || '';
+  const deviceCode = body.deviceCode ? String(body.deviceCode) : '';
+  const rows = await db.query(
+    `SELECT sl_uuid, status, toys FROM active_sessions WHERE status IN ('connected', 'pending')`
+  );
+  const sessions = rows.rows.map((row) => ({
+    sl_uuid: row.sl_uuid,
+    status: row.status,
+    connection: parseConnection(row.toys) || {}
+  }));
+  if (domain) {
+    const sameDomain = sessions.filter((row) => row.connection.domain === domain);
+    if (sameDomain.length === 1) return sameDomain[0].sl_uuid;
+  }
+  if (deviceCode) {
+    const sameDevice = sessions.filter((row) => String(row.connection.deviceCode || '') === deviceCode);
+    if (sameDevice.length === 1) return sameDevice[0].sl_uuid;
+  }
+  const pending = await newestPendingUid();
+  if (pending) return pending;
+  const connected = sessions.filter((row) => row.status === 'connected');
+  if (connected.length === 1) return connected[0].sl_uuid;
+  return '';
+}
+
 app.post('/api/webhook/lovense', async (req, res) => {
   let body = req.body || {};
   if (typeof body === 'string') {
@@ -3057,8 +3192,9 @@ app.post('/api/webhook/lovense', async (req, res) => {
   const httpsPort = body.httpsPort || nested.httpsPort;
   const wsPort = body.wsPort || nested.wsPort;
   const wssPort = body.wssPort || nested.wssPort;
-  const platform = body.platform || nested.platform;
-  const appType = body.appType || nested.appType;
+    const platform = body.platform || nested.platform;
+    const appType = body.appType || nested.appType;
+    const deviceCode = body.deviceCode || nested.deviceCode || '';
   if (!body.toyList && nested.toyList) body = { ...nested, ...body };
 
   try {
@@ -3070,8 +3206,8 @@ app.post('/api/webhook/lovense', async (req, res) => {
       uid = byToken.rows[0] && byToken.rows[0].sl_uuid;
     }
     if (!uid && (body.toyList || body.deviceCode || body.domain)) {
-      uid = await newestPendingUid();
-      if (uid) console.log('Lovense callback matched the open scan', uid);
+      uid = await uidForToyCallback(body);
+      if (uid) console.log('Lovense callback matched a saved link');
     }
     if (!uid) {
       console.error('Lovense callback missing uid', Object.keys(body));
@@ -3120,7 +3256,7 @@ app.post('/api/webhook/lovense', async (req, res) => {
         mergedToys[key] = { ...mergedToys[key], battery: item.battery };
       }
     }
-    const connection = { toys: mergedToys, domain, httpPort, httpsPort, wsPort, wssPort, platform, appType };
+    const connection = { toys: mergedToys, domain, httpPort, httpsPort, wsPort, wssPort, platform, appType, deviceCode };
     const reported = listToys(connection).map((toy) => ({
       name: toy.name,
       battery: toy.battery
@@ -3148,7 +3284,8 @@ app.post('/api/webhook/lovense', async (req, res) => {
     watchBattery({
       sl_uuid: uid,
       status: 'connected',
-      display_name: session.display_name
+      display_name: session.display_name,
+      connection
     });
 
     res.sendStatus(200);
