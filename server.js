@@ -111,6 +111,29 @@ async function ensureSchema() {
   await db.query(`ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS shared BOOLEAN DEFAULT false`);
   await db.query(`ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS vibe_strength INTEGER DEFAULT 0`);
   await db.query(`ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS vibe_until TIMESTAMPTZ`);
+  await db.query(`CREATE TABLE IF NOT EXISTS saved_patterns (
+    id BIGSERIAL PRIMARY KEY,
+    sl_uuid TEXT NOT NULL,
+    name TEXT NOT NULL,
+    name_key TEXT NOT NULL,
+    steps JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (sl_uuid, name_key)
+  )`);
+  await db.query(`CREATE TABLE IF NOT EXISTS control_grants (
+    token TEXT PRIMARY KEY,
+    wearer_uuid TEXT NOT NULL,
+    recipient_uuid TEXT,
+    recipient_name TEXT,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await db.query(`ALTER TABLE control_grants ADD COLUMN IF NOT EXISTS sender_name TEXT`);
+  await db.query(`ALTER TABLE control_grants ADD COLUMN IF NOT EXISTS seconds_left INTEGER`);
+  await db.query(`ALTER TABLE control_grants ADD COLUMN IF NOT EXISTS running_since TIMESTAMPTZ`);
+  await db.query(`UPDATE control_grants
+    SET seconds_left = GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (expires_at - NOW())))::int)
+    WHERE seconds_left IS NULL`);
 }
 ensureSchema().catch((err) => console.error('Schema update failed:', err));
 
@@ -696,22 +719,33 @@ function clampLevel(value) {
 function buildGlide(from, to) {
   const start = clampLevel(from);
   const end = clampLevel(to);
-  if (start === end) return Array(20).fill(start);
+  if (start === end) return [end];
   const sign = Math.sign(end - start);
-  const dwell = 3;
-  const levels = [start];
-  let level = start;
-  while (level !== end && levels.length < 7) {
-    level += sign;
-    levels.push(level);
-  }
-  const counts = levels.map(() => dwell);
   const steps = [];
-  for (let i = 0; i < levels.length; i++) {
-    for (let n = 0; n < counts[i] && steps.length < 50; n++) steps.push(levels[i]);
+  let level = start;
+  const add = (value) => {
+    if (steps.length < 50) steps.push(value);
+    if (steps.length < 50) steps.push(value);
+  };
+  add(level);
+  while (level !== end && steps.length < 48) {
+    level += sign;
+    add(level);
   }
-  while (steps.length < 12) steps.push(levels[levels.length - 1]);
+  while (steps.length < 20) steps.push(steps[steps.length - 1]);
   return steps;
+}
+
+function holdCommand(level, toyId) {
+  const command = {
+    command: 'Function',
+    action: `Vibrate:${clampLevel(level)}`,
+    timeSec: 0,
+    apiVer: 1,
+    stopPrevious: 1
+  };
+  if (toyId) command.toy = toyId;
+  return command;
 }
 
 function playingLevel(state) {
@@ -721,16 +755,11 @@ function playingLevel(state) {
 }
 
 function glideCovers(state, target) {
-  if (!state || !state.steps || !state.playStarted) return false;
-  if (state.playUntil - Date.now() <= 300) return false;
-  const now = playingLevel(state);
-  const end = state.steps[state.steps.length - 1];
+  if (!state || !state.playStarted) return false;
   const goal = clampLevel(target);
-  if (state.flat) return now === goal;
-  const traveling = Math.sign(end - now);
-  const wanted = Math.sign(goal - now);
-  if (wanted === 0 || traveling === 0 || traveling === wanted) return true;
-  return Date.now() - state.playStarted < 400;
+  if (state.flat) return state.at === goal && Date.now() < state.until;
+  if (!state.steps) return false;
+  return state.playUntil - Date.now() > 200;
 }
 
 const followers = new Map();
@@ -778,6 +807,18 @@ async function sendPattern(uid, connection, toyId, steps, timeSec) {
   return sendToyCommand(uid, connection, pattern);
 }
 
+async function sendCustomPattern(uid, connection, toyId, steps, timeSec) {
+  const pattern = {
+    command: 'Pattern',
+    rule: 'V:1;F:v;S:200#',
+    strength: steps.join(';'),
+    timeSec,
+    apiVer: 2
+  };
+  if (toyId) pattern.toy = toyId;
+  return sendToyCommand(uid, connection, pattern);
+}
+
 function schedulePlan(uid, delay) {
   const state = followers.get(uid);
   if (!state || state.busy) return;
@@ -810,44 +851,71 @@ async function planLevel(uid) {
     return;
   }
   if (glideCovers(state, target)) {
-    schedulePlan(uid, Math.max(200, Math.min(500, state.playUntil - Date.now() - 300)));
+    const wait = state.flat
+      ? Math.max(400, state.until - Date.now())
+      : Math.max(200, state.playUntil - Date.now() - 200);
+    schedulePlan(uid, wait);
     return;
   }
 
   const from = playingLevel(state);
-  if (from === 0 && target === 0) {
-    if (state.sentAt && Date.now() - state.sentAt < 1000 && !state.steps) return;
+  if (from === target) {
+    if (target === 0) {
+      if (!state.flat && !state.steps) return;
+      const gen = state.gen;
+      state.busy = true;
+      try {
+        const result = await sendToyCommand(uid, state.connection, functionCommand('Stop', 0, state.toyId));
+        state.lastResult = result;
+        if (!followers.get(uid) || state.gen !== gen) return;
+        state.steps = null;
+        state.flat = false;
+        state.at = 0;
+        state.sentAt = Date.now();
+        state.playStarted = 0;
+        state.playUntil = 0;
+      } catch (err) {
+        console.error('Slider stop failed:', err.message);
+        state.lastResult = { code: 500, message: err.message };
+      } finally {
+        const current = followers.get(uid);
+        if (current && current.gen === gen) current.busy = false;
+      }
+      return;
+    }
+    if (state.flat && state.at === target) return;
     const gen = state.gen;
     state.busy = true;
     try {
-      const result = await sendToyCommand(uid, state.connection, functionCommand('Stop', 0, state.toyId));
+      const result = await sendToyCommand(uid, state.connection, holdCommand(target, state.toyId));
       state.lastResult = result;
       if (!followers.get(uid) || state.gen !== gen) return;
+      if (!commandOk(result)) {
+        console.error('Slider hold rejected:', result && result.code, result && result.message);
+        state.nextSendAt = Date.now() + 1000;
+        return;
+      }
+      const started = Date.now();
+      state.flat = true;
       state.steps = null;
-      state.flat = false;
-      state.at = 0;
-      state.sentAt = Date.now();
-      state.playStarted = 0;
-      state.playUntil = 0;
+      state.at = target;
+      state.sentAt = started;
+      state.playStarted = started;
+      state.playUntil = state.until;
+      state.nextSendAt = started;
     } catch (err) {
-      console.error('Slider stop failed:', err.message);
+      console.error('Slider hold failed:', err.message);
       state.lastResult = { code: 500, message: err.message };
+      state.nextSendAt = Date.now() + 1000;
     } finally {
       const current = followers.get(uid);
-      if (current && current.gen === gen) {
-        current.busy = false;
-        if (clampLevel(current.target) !== 0) schedulePlan(uid, 0);
-      }
+      if (current && current.gen === gen) current.busy = false;
     }
     return;
   }
 
-  const flat = from === target;
-  const steps = flat ? Array(20).fill(target) : buildGlide(from, target);
-  const remain = Math.max(2, Math.ceil((state.until - Date.now()) / 1000));
-  const timeSec = flat
-    ? Math.min(60, remain)
-    : Number((steps.length * 0.1).toFixed(1));
+  const steps = buildGlide(from, target);
+  const timeSec = Number((steps.length * 0.1).toFixed(1));
   const gen = state.gen;
   state.busy = true;
   try {
@@ -856,30 +924,27 @@ async function planLevel(uid) {
     if (!followers.get(uid) || state.gen !== gen) return;
     if (!commandOk(result)) {
       console.error('Slider pattern rejected:', result && result.code, result && result.message);
-      state.nextSendAt = Date.now() + MIN_GAP_MS;
+      state.nextSendAt = Date.now() + 1000;
       return;
     }
     const started = Date.now();
     state.steps = steps;
-    state.flat = flat;
+    state.flat = false;
     state.at = from;
     state.sentAt = started;
     state.playStarted = started;
     state.playUntil = started + timeSec * 1000;
-    state.nextSendAt = Math.min(started + 400, state.playUntil - 300);
+    state.nextSendAt = state.playUntil - 200;
   } catch (err) {
     console.error('Slider pattern failed:', err.message);
     state.lastResult = { code: 500, message: err.message };
-    state.nextSendAt = Date.now() + MIN_GAP_MS;
+    state.nextSendAt = Date.now() + 1000;
   } finally {
     const current = followers.get(uid);
     if (current && current.gen === gen) {
       current.busy = false;
-      if (Date.now() < current.until || clampLevel(current.target) === 0) {
-        const wait = glideCovers(current, current.target)
-          ? Math.max(200, Math.min(500, current.playUntil - Date.now() - 300))
-          : Math.max(0, current.nextSendAt - Date.now());
-        schedulePlan(uid, wait);
+      if (!current.flat && current.steps && (Date.now() < current.until || clampLevel(current.target) === 0)) {
+        schedulePlan(uid, Math.max(200, current.playUntil - Date.now() - 200));
       }
     }
   }
@@ -897,6 +962,178 @@ async function sendSmoothLevel(uid, connection, toyId, target, seconds) {
   }
   await planLevel(uid);
   return state.lastResult || { code: 200, result: true };
+}
+
+const GRANT_MINUTES = new Set([1, 5, 10, 15, 30, 60]);
+const guestStops = new Map();
+
+function clearGuestStop(wearer) {
+  const prev = guestStops.get(wearer);
+  if (!prev) return;
+  clearTimeout(prev.timer);
+  guestStops.delete(wearer);
+}
+
+async function stopWearerToy(wearer) {
+  const session = await getSession(wearer);
+  if (!session || !session.connection) return;
+  cancelFade(wearer);
+  await sendToyCommand(wearer, session.connection, {
+    command: 'Function',
+    action: 'Stop',
+    timeSec: 0,
+    apiVer: 1,
+    stopPrevious: 1
+  });
+  await db.query(
+    `UPDATE active_sessions SET vibe_strength = 0, vibe_until = NOW() WHERE sl_uuid = $1`,
+    [wearer]
+  );
+}
+
+function armGuestStop(wearer, token, secondsLeft) {
+  clearGuestStop(wearer);
+  const delay = Math.max(0, secondsLeft * 1000);
+  const timer = setTimeout(() => {
+    guestStops.delete(wearer);
+    finishGrant(token, wearer).catch((err) => console.error("Grant stop failed:", err));
+  }, delay);
+  guestStops.set(wearer, { timer, token });
+}
+
+async function finishGrant(token, wearer) {
+  const done = await db.query(
+    `UPDATE control_grants
+     SET seconds_left = 0, running_since = NULL
+     WHERE token = $1 AND running_since IS NOT NULL
+     RETURNING token`,
+    [token]
+  );
+  if (!done.rows.length) return;
+  await stopWearerToy(wearer);
+}
+
+function grantRemaining(row) {
+  let left = parseInt(row.seconds_left, 10);
+  if (Number.isNaN(left)) {
+    left = Math.floor((new Date(row.expires_at).getTime() - Date.now()) / 1000);
+  }
+  if (row.running_since) {
+    const elapsed = Math.max(0, (Date.now() - new Date(row.running_since).getTime()) / 1000);
+    left -= elapsed;
+  }
+  return Math.max(0, Math.floor(left));
+}
+
+async function readGrant(token) {
+  const result = await db.query(
+    `SELECT seconds_left, running_since, expires_at FROM control_grants WHERE token = $1`,
+    [token]
+  );
+  if (!result.rows.length) return null;
+  const row = result.rows[0];
+  return { secondsLeft: grantRemaining(row), running: !!row.running_since };
+}
+
+async function pauseGrant(token) {
+  const paused = await db.query(
+    `UPDATE control_grants
+     SET seconds_left = GREATEST(
+           0,
+           seconds_left - GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (NOW() - running_since)))::int)
+         ),
+         running_since = NULL
+     WHERE token = $1 AND running_since IS NOT NULL
+     RETURNING seconds_left`,
+    [token]
+  );
+  if (paused.rows.length) return parseInt(paused.rows[0].seconds_left, 10) || 0;
+  const current = await readGrant(token);
+  return current ? current.secondsLeft : 0;
+}
+
+async function beginGrantRun(token) {
+  const started = await db.query(
+    `UPDATE control_grants
+     SET running_since = COALESCE(running_since, NOW())
+     WHERE token = $1 AND seconds_left > 1
+     RETURNING seconds_left, running_since, expires_at`,
+    [token]
+  );
+  if (!started.rows.length) return null;
+  const secondsLeft = grantRemaining(started.rows[0]);
+  if (secondsLeft <= 1) return null;
+  return { secondsLeft, running: true };
+}
+
+async function startGuestClock(actor, wearer) {
+  const run = await beginGrantRun(actor.token);
+  if (!run) return null;
+  armGuestStop(wearer, actor.token, run.secondsLeft);
+  return { seconds_left: run.secondsLeft, running: true };
+}
+
+async function stopGuestClock(actor, wearer) {
+  clearGuestStop(wearer);
+  const left = await pauseGrant(actor.token);
+  return { seconds_left: left, running: false };
+}
+
+async function releaseGuestRun(wearer) {
+  clearGuestStop(wearer);
+  await db.query(
+    `UPDATE control_grants
+     SET seconds_left = GREATEST(
+           0,
+           seconds_left - GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (NOW() - running_since)))::int)
+         ),
+         running_since = NULL
+     WHERE wearer_uuid = $1 AND running_since IS NOT NULL`,
+    [wearer]
+  );
+}
+
+async function resolveControl(body) {
+  const token = String((body && body.grant_token) || '');
+  if (token) {
+    if (!token || token.length > 80) return { error: "This control link is not valid.", status: 404 };
+    const result = await db.query(
+      `SELECT wearer_uuid, expires_at, sender_name, seconds_left, running_since FROM control_grants WHERE token = $1`,
+      [token]
+    );
+    if (!result.rows.length) return { error: "This control link is not valid.", status: 404 };
+    const row = result.rows[0];
+    const secondsLeft = grantRemaining(row);
+    if (secondsLeft <= 0) {
+      if (row.running_since) {
+        await db.query(
+          `UPDATE control_grants SET seconds_left = 0, running_since = NULL WHERE token = $1`,
+          [token]
+        );
+      }
+      return { error: "This control time is used up.", status: 403 };
+    }
+    return {
+      wearer: row.wearer_uuid,
+      guest: true,
+      expiresAt: new Date(row.expires_at),
+      senderName: row.sender_name || '',
+      token,
+      secondsLeft,
+      running: !!row.running_since
+    };
+  }
+  const wearer = String((body && (body.wearer_uuid || body.sl_uuid)) || '');
+  if (!wearer || wearer.length > 80) return { error: "Missing wearer_uuid.", status: 400 };
+  return { wearer, guest: false, expiresAt: null };
+}
+
+function limitSeconds(seconds, actor) {
+  if (!actor.guest) return { seconds };
+  const left = actor.secondsLeft;
+  if (left <= 1) return { error: "This control time is used up.", status: 403 };
+  if (seconds <= 0) return { seconds: 0 };
+  return { seconds: Math.min(seconds, left) };
 }
 
 async function getSession(slUuid) {
@@ -1160,6 +1397,71 @@ app.post('/api/hud/share', async (req, res) => {
   }
 });
 
+app.post('/api/hud/grant', async (req, res) => {
+  const wearer = String(req.body.sl_uuid || '');
+  const recipient = String(req.body.recipient_uuid || '');
+  const recipientName = String(req.body.recipient_name || 'someone').replace(/[\r\n\t]/g, ' ').trim().slice(0, 64) || 'someone';
+  const sentName = String(req.body.sender_name || '').replace(/[\r\n\t]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 64);
+  const minutes = parseInt(req.body.minutes, 10);
+  if (!wearer || !recipient) return res.status(400).json({ error: "Missing avatar." });
+  if (!GRANT_MINUTES.has(minutes)) return res.status(400).json({ error: "Pick 1, 5, 10, 15, 30, or 60 minutes." });
+  if (recipient === wearer) return res.status(400).json({ error: "Pick someone else." });
+
+  try {
+    const session = await getSession(wearer);
+    if (!session || session.status !== 'connected') {
+      return res.status(404).json({ error: "Link your toy before sending a control link." });
+    }
+    const senderName = sentName || String(session.display_name || '').trim();
+    const token = crypto.randomBytes(18).toString('hex');
+    await db.query(
+      `INSERT INTO control_grants (token, wearer_uuid, recipient_uuid, recipient_name, sender_name, seconds_left, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW() + ($7 * INTERVAL '1 minute'))`,
+      [token, wearer, recipient, recipientName, senderName || null, minutes * 60, minutes]
+    );
+    if (senderName) {
+      await db.query(
+        `UPDATE active_sessions SET display_name = $2 WHERE sl_uuid = $1`,
+        [wearer, senderName]
+      );
+    }
+    return res.json({
+      success: true,
+      minutes,
+      control_url: `${publicBase(req)}/guest/${token}`
+    });
+  } catch (err) {
+    console.error("Grant error:", err);
+    res.status(500).json({ error: "Could not create the control link." });
+  }
+});
+
+app.get('/api/hud/grant/:token', async (req, res) => {
+  try {
+    const actor = await resolveControl({ grant_token: req.params.token });
+    if (actor.error) return res.status(actor.status).json({ error: actor.error });
+    const session = await getSession(actor.wearer);
+    if (!session || session.status !== 'connected') {
+      return res.status(404).json({ error: "Toy is not connected." });
+    }
+    const toys = await toysForSession(session);
+    const patterns = await db.query(
+      `SELECT id, name FROM saved_patterns WHERE sl_uuid = $1 ORDER BY created_at ASC, id ASC`,
+      [actor.wearer]
+    );
+    return res.json({
+      toys,
+      patterns: patterns.rows,
+      seconds_left: actor.secondsLeft,
+      running: actor.running,
+      owner_name: actor.senderName || session.display_name || ''
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not open this control link." });
+  }
+});
+
 app.get('/control', (req, res) => {
   res.type('html').send(`<!DOCTYPE html>
 <html>
@@ -1217,14 +1519,13 @@ app.get('/api/hud/toys/:sl_uuid', async (req, res) => {
   }
 });
 
-app.get('/control/:sl_uuid', (req, res) => {
-  const slUuid = req.params.sl_uuid;
+function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSeconds, grantRunning) {
   res.type('html').send(`<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Hot Hawaiian Nights</title>
+  <title>${ownerName ? "Control " + ownerName.replace(/[&<>"]/g, "") + " — Hot Hawaiian Nights" : "Hot Hawaiian Nights"}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Pacifico&display=swap" rel="stylesheet">
@@ -1247,7 +1548,22 @@ app.get('/control/:sl_uuid', (req, res) => {
     select, input { padding: 8px; border-radius: 6px; border: 0; }
     button { padding: 12px; border: 0; border-radius: 8px; background: #ff4da6; color: #fff; font-weight: bold; }
     button.secondary { background: #444; }
+    h2 { font-size: 16px; margin: 18px 0 4px; }
+    .pattern-note { margin: 0 0 8px; color: #ccc; font-size: 14px; }
+    .patterns { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .patterns button { margin: 0; background: #6b2d78; }
+    #builder[hidden] { display: none; }
+    #bars { display: grid; grid-template-columns: repeat(16, 1fr); gap: 3px; height: 140px; margin: 8px 0; touch-action: none; }
+    #bars button { margin: 0; padding: 0; height: 100%; background: #2a2a2a; position: relative; overflow: hidden; border-radius: 4px; }
+    #bars button span { position: absolute; left: 0; right: 0; bottom: 0; background: linear-gradient(#ff8a1e, #ff3d6e); pointer-events: none; }
+    #playDraft { background: #6b2d78; }
+    .saved { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
+    .saved-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+    .saved-row button { margin: 0; }
+    .saved-row .remove { width: auto; background: #444; padding: 12px 14px; }
     #status { min-height: 24px; color: #9f9; }
+    .sender { margin: 2px 0 0; font-size: 22px; font-weight: bold; color: #ffe08a; }
+    [hidden] { display: none !important; }
   </style>
 </head>
 <body>
@@ -1255,7 +1571,9 @@ app.get('/control/:sl_uuid', (req, res) => {
     <img src="/logo.png" alt="Hot Hawaiian Nights">
     <h1>HOT HAWAIIAN NIGHTS</h1>
   </header>
-  <p>Move the slider. Power follows while you drag, and the motor keeps running through the change.</p>
+  <p id="senderName" class="sender"${ownerName ? "" : " hidden"}></p>
+  <p id="intro">Move the slider. The motor stays on and the strength eases while you drag.</p>
+  <p id="grantLine" class="pattern-note"></p>
   <label for="toy">Toy</label>
   <select id="toy"><option value="">All connected toys</option></select>
   <label for="strength">Vibration 0–100: <span id="strengthVal">0</span></label>
@@ -1263,12 +1581,44 @@ app.get('/control/:sl_uuid', (req, res) => {
   <label for="duration">Seconds</label>
   <input id="duration" type="number" min="1" max="60" value="5">
   <button id="vibrate">Vibrate for those seconds</button>
+  <h2>Vibration patterns</h2>
+  <p class="pattern-note">Lovense patterns for Connect and Remote. They run for the seconds above.</p>
+  <div class="patterns">
+    <button type="button" data-pattern="pulse">Pulse</button>
+    <button type="button" data-pattern="wave">Wave</button>
+    <button type="button" data-pattern="fireworks">Fireworks</button>
+    <button type="button" data-pattern="earthquake">Earthquake</button>
+  </div>
+  <h2 id="mineHeading">My patterns</h2>
+  <p id="mineNote" class="pattern-note">Saved on this avatar. They stay here every time you open the controls.</p>
+  <div id="savedPatterns" class="saved"></div>
+  <button type="button" id="makePattern" class="secondary">Make a pattern</button>
+  <div id="builder" hidden>
+    <label for="patternName">Name</label>
+    <input id="patternName" maxlength="24" placeholder="Slow rise">
+    <p class="pattern-note">Drag the bars. Each bar is one beat, from off at the bottom to full at the top.</p>
+    <div id="bars"></div>
+    <button type="button" id="playDraft">Try it</button>
+    <button type="button" id="savePattern">Save for this avatar</button>
+  </div>
     <button id="stop" class="secondary">Stop</button>
     <button id="disconnect" class="secondary">Disconnect</button>
   <p id="battery"></p>
   <p id="status">Loading toys…</p>
   <script>
     const uuid = ${JSON.stringify(slUuid)};
+    const guestToken = ${JSON.stringify(guestToken || "")};
+    const guestEnds = ${Number(guestEnds) || 0};
+    let ownerName = ${JSON.stringify(ownerName || "")};
+    let grantLeft = ${Number(grantSeconds) || 0};
+    let grantRunning = ${grantRunning ? "true" : "false"};
+    let grantSync = Date.now();
+
+    function withActor(body) {
+      if (guestToken) body.grant_token = guestToken;
+      else body.wearer_uuid = uuid;
+      return body;
+    }
     const toySelect = document.getElementById("toy");
     const strength = document.getElementById("strength");
     const strengthVal = document.getElementById("strengthVal");
@@ -1351,9 +1701,10 @@ app.get('/control/:sl_uuid', (req, res) => {
       endsAt = 0;
     }
 
-    function beginSession() {
-      if (endsAt > Date.now()) return;
-      endsAt = Date.now() + allowedSeconds() * 1000;
+    function beginSession(reset) {
+      if (!reset && endsAt > Date.now()) return;
+      const seconds = reset ? Math.max(2, allowedSeconds()) : allowedSeconds();
+      endsAt = Date.now() + seconds * 1000;
       if (clock) clearInterval(clock);
       clock = setInterval(() => {
         if (remaining() > 0) return;
@@ -1361,7 +1712,9 @@ app.get('/control/:sl_uuid', (req, res) => {
         strength.value = "0";
         strengthVal.textContent = "0";
         desired = 0;
-        status.textContent = "Time is up.";
+        status.textContent = guestToken
+          ? "Paused. You can start again with the time left."
+          : "Time is up.";
         queueSend(true);
       }, 250);
     }
@@ -1376,17 +1729,17 @@ app.get('/control/:sl_uuid', (req, res) => {
       if (!r.ok || data.error) {
         throw new Error(data.error || "Command failed.");
       }
+      if (guestToken) applyGrant(data);
       return data;
     }
 
     function commandBody(level, seconds, immediateStop) {
-      return {
-        wearer_uuid: uuid,
+      return withActor({
         strength: level,
         duration: seconds,
         stop: !!immediateStop,
         toy_id: toySelect.value || undefined
-      };
+      });
     }
 
     function toyLabel(toy) {
@@ -1456,7 +1809,9 @@ app.get('/control/:sl_uuid', (req, res) => {
 
     async function loadToys() {
       try {
-        const r = await fetch("/api/hud/toys/" + encodeURIComponent(uuid));
+        const r = await fetch(guestToken
+          ? ("/api/hud/grant/" + encodeURIComponent(guestToken))
+          : ("/api/hud/toys/" + encodeURIComponent(uuid)));
         const data = await r.json();
         if (!r.ok) {
           status.textContent = data.error || "Could not load toys.";
@@ -1464,6 +1819,7 @@ app.get('/control/:sl_uuid', (req, res) => {
         }
         localCommand = data.local_command || "";
         showToys(data.toys);
+        if (guestToken) renderGuestPatterns(data.patterns || []);
         status.textContent = (data.toys && data.toys.length)
           ? "Move the slider. Power follows while you drag."
           : "No toys reported yet. Keep Lovense Connect open and refresh.";
@@ -1471,6 +1827,34 @@ app.get('/control/:sl_uuid', (req, res) => {
         status.textContent = "Failed to load toys.";
       }
     }
+
+    document.querySelectorAll("[data-pattern]").forEach((button) => {
+      button.onclick = async () => {
+        const name = button.getAttribute("data-pattern");
+        const seconds = Math.max(2, allowedSeconds());
+        stopClock();
+        desired = 0;
+        lastSent = 0;
+        beginSession(true);
+        status.textContent = button.textContent + " for " + seconds + " seconds.";
+        try {
+          const r = await fetch("/api/hud/pattern", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(withActor({
+              name,
+              duration: seconds,
+              toy_id: toySelect.value || undefined
+            }))
+          });
+          const data = await r.json();
+          if (!r.ok || data.error) throw new Error(data.error || "Pattern failed.");
+          if (guestToken) applyGrant(data);
+        } catch (e) {
+          status.textContent = e.message || "Pattern failed.";
+        }
+      };
+    });
 
     document.getElementById("vibrate").onclick = () => {
       const level = parseInt(strength.value, 10) || 0;
@@ -1491,6 +1875,185 @@ app.get('/control/:sl_uuid', (req, res) => {
       desired = 0;
       queueSend(true);
     };
+
+    const BAR_COUNT = 16;
+    let draft = Array.from({ length: BAR_COUNT }, () => 0);
+    let painting = false;
+
+    function renderBars() {
+      const box = document.getElementById("bars");
+      box.replaceChildren();
+      draft.forEach((level) => {
+        const bar = document.createElement("button");
+        bar.type = "button";
+        const fill = document.createElement("span");
+        fill.style.height = Math.round((level / 20) * 100) + "%";
+        bar.appendChild(fill);
+        box.appendChild(bar);
+      });
+    }
+
+    function paintAt(event) {
+      const bars = document.getElementById("bars").children;
+      for (let i = 0; i < bars.length; i++) {
+        const rect = bars[i].getBoundingClientRect();
+        if (event.clientX < rect.left || event.clientX > rect.right) continue;
+        const ratio = 1 - (event.clientY - rect.top) / rect.height;
+        const level = Math.max(0, Math.min(20, Math.round(ratio * 20)));
+        draft[i] = level;
+        bars[i].firstChild.style.height = Math.round((level / 20) * 100) + "%";
+      }
+    }
+
+    async function playCustom(label, extra) {
+      const seconds = Math.max(2, allowedSeconds());
+      stopClock();
+      desired = 0;
+      lastSent = 0;
+      beginSession(true);
+      status.textContent = label + " for " + seconds + " seconds.";
+      try {
+        const r = await fetch("/api/hud/custom-pattern", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(Object.assign(withActor({
+            duration: seconds,
+            toy_id: toySelect.value || undefined
+          }), extra))
+        });
+        const data = await r.json();
+        if (!r.ok || data.error) throw new Error(data.error || "Pattern failed.");
+        if (guestToken) applyGrant(data);
+      } catch (e) {
+        status.textContent = e.message || "Pattern failed.";
+      }
+    }
+
+    function renderGuestPatterns(rows) {
+      const box = document.getElementById("savedPatterns");
+      box.replaceChildren();
+      if (!rows.length) {
+        const empty = document.createElement("p");
+        empty.className = "pattern-note";
+        empty.textContent = "No saved patterns yet.";
+        box.appendChild(empty);
+        return;
+      }
+      rows.forEach((row) => {
+        const play = document.createElement("button");
+        play.type = "button";
+        play.textContent = row.name;
+        play.onclick = () => playCustom(row.name, { id: row.id });
+        box.appendChild(play);
+      });
+    }
+
+    async function loadSaved() {
+      const box = document.getElementById("savedPatterns");
+      box.replaceChildren();
+      try {
+        const r = await fetch("/api/hud/patterns/" + encodeURIComponent(uuid));
+        const data = await r.json();
+        const rows = (data && data.patterns) || [];
+        if (!rows.length) {
+          const empty = document.createElement("p");
+          empty.className = "pattern-note";
+          empty.textContent = "No saved patterns yet.";
+          box.appendChild(empty);
+          return;
+        }
+        rows.forEach((row) => {
+          const line = document.createElement("div");
+          line.className = "saved-row";
+          const play = document.createElement("button");
+          play.type = "button";
+          play.textContent = row.name;
+          play.onclick = () => playCustom(row.name, { id: row.id });
+          const remove = document.createElement("button");
+          remove.type = "button";
+          remove.className = "secondary remove";
+          remove.textContent = "Remove";
+          remove.onclick = async () => {
+            const response = await fetch("/api/hud/patterns/delete", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ wearer_uuid: uuid, id: row.id })
+            });
+            const result = await response.json();
+            if (!response.ok || result.error) {
+              status.textContent = result.error || "Could not remove that pattern.";
+              return;
+            }
+            status.textContent = row.name + " removed.";
+            loadSaved();
+          };
+          line.append(play, remove);
+          box.appendChild(line);
+        });
+      } catch (e) {
+        const empty = document.createElement("p");
+        empty.className = "pattern-note";
+        empty.textContent = "Saved patterns could not be loaded.";
+        box.appendChild(empty);
+      }
+    }
+
+    const bars = document.getElementById("bars");
+    renderBars();
+    bars.addEventListener("pointerdown", (event) => {
+      painting = true;
+      bars.setPointerCapture(event.pointerId);
+      paintAt(event);
+      event.preventDefault();
+    });
+    bars.addEventListener("pointermove", (event) => {
+      if (!painting) return;
+      paintAt(event);
+    });
+    bars.addEventListener("pointerup", () => { painting = false; });
+    bars.addEventListener("pointercancel", () => { painting = false; });
+
+    document.getElementById("makePattern").onclick = () => {
+      const builder = document.getElementById("builder");
+      builder.hidden = !builder.hidden;
+    };
+    document.getElementById("playDraft").onclick = () => {
+      if (draft.every((n) => n === 0)) {
+        status.textContent = "Raise at least one bar.";
+        return;
+      }
+      const label = document.getElementById("patternName").value.trim() || "Custom";
+      playCustom(label, { steps: draft.slice() });
+    };
+    document.getElementById("savePattern").onclick = async () => {
+      const name = document.getElementById("patternName").value.trim();
+      if (!name) {
+        status.textContent = "Name the pattern first.";
+        return;
+      }
+      if (draft.every((n) => n === 0)) {
+        status.textContent = "Raise at least one bar.";
+        return;
+      }
+      try {
+        const r = await fetch("/api/hud/patterns", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ wearer_uuid: uuid, name, steps: draft.slice() })
+        });
+        const data = await r.json();
+        if (!r.ok || data.error) throw new Error(data.error || "Could not save.");
+        status.textContent = name + " saved for this avatar.";
+        document.getElementById("builder").hidden = true;
+        document.getElementById("patternName").value = "";
+        draft = Array.from({ length: BAR_COUNT }, () => 0);
+        renderBars();
+        loadSaved();
+      } catch (e) {
+        status.textContent = e.message || "Could not save.";
+      }
+    };
+
     document.getElementById("disconnect").onclick = async () => {
       stopClock();
       strength.value = "0";
@@ -1513,8 +2076,87 @@ app.get('/control/:sl_uuid', (req, res) => {
         status.textContent = "Could not disconnect.";
       }
     };
-    loadToys().then(() => readBattery());
+    function showSender(name) {
+      const sender = document.getElementById("senderName");
+      if (!name) {
+        sender.hidden = true;
+        sender.textContent = "";
+        return;
+      }
+      ownerName = name;
+      sender.hidden = false;
+      sender.textContent = name;
+      document.title = "Control " + name + " — Hot Hawaiian Nights";
+    }
+
+    function shownGrantLeft() {
+      if (!grantRunning) return Math.max(0, grantLeft);
+      return Math.max(0, grantLeft - Math.floor((Date.now() - grantSync) / 1000));
+    }
+
+    function applyGrant(data) {
+      if (!data || data.seconds_left == null) return;
+      grantLeft = Math.max(0, Math.floor(data.seconds_left));
+      grantRunning = !!data.running;
+      grantSync = Date.now();
+      renderGrant();
+    }
+
+    function renderGrant() {
+      if (!guestToken) return;
+      const line = document.getElementById("grantLine");
+      const left = shownGrantLeft();
+      const mins = Math.floor(left / 60);
+      const secs = left % 60;
+      const clockText = mins + ":" + (secs < 10 ? "0" : "") + secs;
+      if (left <= 0) {
+        line.textContent = "Control time is used up.";
+        status.textContent = "Control time is used up.";
+        document.querySelectorAll("button, input, select").forEach((el) => { el.disabled = true; });
+        return;
+      }
+      line.textContent = grantRunning
+        ? ("Controlling " + (ownerName || "their") + "'s toy. Time left " + clockText + ".")
+        : ("Time left " + clockText + ". Paused. Start again to use the rest.");
+    }
+
+    function tickGrant() {
+      renderGrant();
+    }
+
+    if (guestToken) {
+      showSender(ownerName);
+      document.getElementById("intro").textContent = ownerName
+        ? ("You are controlling " + ownerName + "'s toy. Time runs only while the toy is on.")
+        : "Time runs only while the toy is on. Stop keeps the rest.";
+      document.getElementById("mineHeading").textContent = ownerName ? (ownerName + "'s patterns") : "Their patterns";
+      document.getElementById("mineNote").textContent = "Patterns this avatar saved. They run for the seconds above.";
+      document.getElementById("disconnect").hidden = true;
+      document.getElementById("makePattern").hidden = true;
+      document.getElementById("builder").hidden = true;
+      tickGrant();
+      setInterval(tickGrant, 1000);
+    }
+    loadToys().then(() => { if (!guestToken) readBattery(); });
+    if (!guestToken) loadSaved();
     setInterval(() => {
+      if (guestToken) {
+        fetch("/api/hud/grant/" + encodeURIComponent(guestToken))
+          .then((r) => r.json())
+          .then((data) => {
+            if (data && data.seconds_left != null) applyGrant(data);
+            else if (data && data.error) {
+              grantLeft = 0;
+              grantRunning = false;
+              renderGrant();
+            }
+            if (data && data.owner_name) showSender(data.owner_name);
+            if (data && data.toys) showToys(data.toys);
+            if (data && data.error) status.textContent = data.error;
+          })
+          .catch(() => {});
+        return;
+      }
       fetch("/api/hud/status/" + encodeURIComponent(uuid))
         .then((r) => r.json())
         .then((data) => { if (data && data.toys) showToys(data.toys); })
@@ -1523,6 +2165,27 @@ app.get('/control/:sl_uuid', (req, res) => {
   </script>
 </body>
 </html>`);
+}
+
+function guestMessage(text) {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Hot Hawaiian Nights</title></head><body style="font-family:sans-serif;background:#111;color:#eee;max-width:420px;margin:0 auto;padding:24px"><h1>Hot Hawaiian Nights</h1><p>${text}</p></body></html>`;
+}
+
+app.get('/control/:sl_uuid', (req, res) => {
+  sendControlPage(res, req.params.sl_uuid, "", 0, "");
+});
+
+app.get('/guest/:token', async (req, res) => {
+  try {
+    const actor = await resolveControl({ grant_token: req.params.token });
+    if (actor.error) return res.status(actor.status).type('html').send(guestMessage(actor.error));
+    const session = await getSession(actor.wearer);
+    const senderName = actor.senderName || (session && session.display_name) || "";
+    sendControlPage(res, "", req.params.token, 0, senderName, actor.secondsLeft, actor.running);
+  } catch (err) {
+    console.error(err);
+    res.status(500).type('html').send(guestMessage("Could not open this control link."));
+  }
 });
 
 async function newestPendingUid() {
@@ -1736,12 +2399,230 @@ app.post('/api/hud/battery', async (req, res) => {
   }
 });
 
-app.post('/api/hud/vibrate', async (req, res) => {
-  const { wearer_uuid, strength, duration, toy_id, stop } = req.body;
+const LOVENSE_PRESETS = new Set(['pulse', 'wave', 'fireworks', 'earthquake']);
 
-  if (!wearer_uuid) {
-    return res.status(400).json({ error: "Missing wearer_uuid." });
+function cleanPatternName(raw) {
+  const name = String(raw || '').replace(/[\r\n\t]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (name.length < 1 || name.length > 24) return null;
+  return name;
+}
+
+function normalizeSteps(raw) {
+  if (!Array.isArray(raw) || raw.length < 2 || raw.length > 50) return null;
+  const steps = [];
+  for (const item of raw) {
+    const value = parseInt(item, 10);
+    if (Number.isNaN(value)) return null;
+    steps.push(Math.max(0, Math.min(20, value)));
   }
+  if (steps.every((n) => n === 0)) return null;
+  return steps;
+}
+
+app.get('/api/hud/patterns/:sl_uuid', async (req, res) => {
+  const wearer = String(req.params.sl_uuid || '');
+  if (!wearer || wearer.length > 80) return res.status(400).json({ error: "Missing wearer." });
+  try {
+    const result = await db.query(
+      `SELECT id, name, steps FROM saved_patterns WHERE sl_uuid = $1 ORDER BY created_at ASC, id ASC`,
+      [wearer]
+    );
+    res.json({ patterns: result.rows });
+  } catch (err) {
+    console.error("Pattern list error:", err);
+    res.status(500).json({ error: "Could not load saved patterns." });
+  }
+});
+
+app.post('/api/hud/patterns', async (req, res) => {
+  const wearer = String(req.body.wearer_uuid || '');
+  const name = cleanPatternName(req.body.name);
+  const steps = normalizeSteps(req.body.steps);
+  if (!wearer || wearer.length > 80) return res.status(400).json({ error: "Missing wearer_uuid." });
+  if (!name) return res.status(400).json({ error: "Name the pattern in 24 characters or less." });
+  if (!steps) return res.status(400).json({ error: "Draw at least one beat, up to 50." });
+
+  try {
+    const existing = await db.query(
+      `SELECT id FROM saved_patterns WHERE sl_uuid = $1 AND name_key = $2`,
+      [wearer, name.toLowerCase()]
+    );
+    if (!existing.rows.length) {
+      const count = await db.query(
+        `SELECT COUNT(*)::int AS n FROM saved_patterns WHERE sl_uuid = $1`,
+        [wearer]
+      );
+      if (count.rows[0].n >= 12) {
+        return res.status(400).json({ error: "This avatar already has 12 patterns. Remove one to save another." });
+      }
+    }
+    const saved = await db.query(
+      `INSERT INTO saved_patterns (sl_uuid, name, name_key, steps)
+       VALUES ($1, $2, $3, $4::jsonb)
+       ON CONFLICT (sl_uuid, name_key)
+       DO UPDATE SET name = EXCLUDED.name, steps = EXCLUDED.steps
+       RETURNING id, name`,
+      [wearer, name, name.toLowerCase(), JSON.stringify(steps)]
+    );
+    res.json({ success: true, pattern: saved.rows[0] });
+  } catch (err) {
+    console.error("Pattern save error:", err);
+    res.status(500).json({ error: "Could not save that pattern." });
+  }
+});
+
+app.post('/api/hud/patterns/delete', async (req, res) => {
+  const wearer = String(req.body.wearer_uuid || '');
+  const id = parseInt(req.body.id, 10);
+  if (!wearer || !id) return res.status(400).json({ error: "Missing pattern." });
+  try {
+    await db.query(`DELETE FROM saved_patterns WHERE id = $1 AND sl_uuid = $2`, [id, wearer]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Pattern delete error:", err);
+    res.status(500).json({ error: "Could not remove that pattern." });
+  }
+});
+
+app.post('/api/hud/custom-pattern', async (req, res) => {
+  const actor = await resolveControl(req.body);
+  if (actor.error) return res.status(actor.status).json({ error: actor.error });
+  const wearer = actor.wearer;
+  if (!actor.guest) await releaseGuestRun(wearer);
+
+  try {
+    const session = await getSession(wearer);
+    if (!session || session.status !== 'connected') {
+      return res.status(404).json({ error: "Toy is not connected or session expired. Re-link the QR." });
+    }
+
+    let steps = normalizeSteps(req.body.steps);
+    if (!steps && req.body.id) {
+      const stored = await db.query(
+        `SELECT steps FROM saved_patterns WHERE id = $1 AND sl_uuid = $2`,
+        [parseInt(req.body.id, 10), wearer]
+      );
+      if (!stored.rows.length) return res.status(404).json({ error: "That saved pattern is gone." });
+      steps = normalizeSteps(stored.rows[0].steps);
+    }
+    if (!steps) return res.status(400).json({ error: "That pattern has no beats." });
+
+    let seconds = parseInt(req.body.duration, 10);
+    if (Number.isNaN(seconds)) seconds = 5;
+    seconds = Math.max(2, Math.min(60, seconds));
+    const limitedCustom = limitSeconds(seconds, actor);
+    if (limitedCustom.error) return res.status(limitedCustom.status).json({ error: limitedCustom.error });
+    seconds = limitedCustom.seconds;
+    cancelFade(wearer);
+
+    const commandData = await sendCustomPattern(
+      wearer,
+      session.connection,
+      req.body.toy_id,
+      steps,
+      seconds
+    );
+    if (!commandOk(commandData)) {
+      const offline = commandData && (commandData.code === 507 || /offline/i.test(String(commandData.message || '')));
+      return res.status(502).json({
+        error: offline
+          ? "Lovense Remote is asleep. Open Remote, keep the phone screen on, then try the pattern again."
+          : (commandData.message || "Lovense rejected the pattern."),
+        details: commandData
+      });
+    }
+
+    await db.query(
+      `UPDATE active_sessions
+       SET vibe_strength = 10,
+           vibe_until = NOW() + ($2 * INTERVAL '1 second')
+       WHERE sl_uuid = $1`,
+      [wearer, seconds]
+    );
+    if (actor.guest) {
+      const clock = await startGuestClock(actor, wearer);
+      if (clock) Object.assign(commandData, clock);
+    }
+    return res.json({ success: true, details: commandData, seconds_left: commandData.seconds_left, running: commandData.running });
+  } catch (err) {
+    console.error("Custom pattern error:", err);
+    res.status(500).json({ error: err.message || "Failed to start the pattern." });
+  }
+});
+
+app.post('/api/hud/pattern', async (req, res) => {
+  const actor = await resolveControl(req.body);
+  if (actor.error) return res.status(actor.status).json({ error: actor.error });
+  const wearer = actor.wearer;
+  const name = String(req.body.name || '').toLowerCase();
+  if (!LOVENSE_PRESETS.has(name)) {
+    return res.status(400).json({ error: "Choose pulse, wave, fireworks, or earthquake." });
+  }
+  if (!actor.guest) await releaseGuestRun(wearer);
+
+  try {
+    const session = await getSession(wearer);
+    if (!session || session.status !== 'connected') {
+      return res.status(404).json({ error: "Toy is not connected or session expired. Re-link the QR." });
+    }
+
+    let seconds = parseInt(req.body.duration, 10);
+    if (Number.isNaN(seconds)) seconds = 5;
+    seconds = Math.max(2, Math.min(60, seconds));
+    const limitedPreset = limitSeconds(seconds, actor);
+    if (limitedPreset.error) return res.status(limitedPreset.status).json({ error: limitedPreset.error });
+    seconds = limitedPreset.seconds;
+    cancelFade(wearer);
+
+    const command = {
+      command: 'Preset',
+      name,
+      timeSec: seconds,
+      apiVer: 1
+    };
+    if (req.body.toy_id) command.toy = req.body.toy_id;
+
+    const commandData = await sendToyCommand(wearer, session.connection, command);
+    if (!commandOk(commandData)) {
+      const offline = commandData && (commandData.code === 507 || /offline/i.test(String(commandData.message || '')));
+      return res.status(502).json({
+        error: offline
+          ? "Lovense Remote is asleep. Open Remote, keep the phone screen on, then try the pattern again."
+          : (commandData.message || "Lovense rejected the pattern."),
+        details: commandData
+      });
+    }
+
+    await db.query(
+      `UPDATE active_sessions
+       SET vibe_strength = 10,
+           vibe_until = NOW() + ($2 * INTERVAL '1 second')
+       WHERE sl_uuid = $1`,
+      [wearer, seconds]
+    );
+    if (actor.guest) {
+      const clock = await startGuestClock(actor, wearer);
+      if (clock) Object.assign(commandData, clock);
+    }
+    return res.json({
+      success: true,
+      pattern: name,
+      details: commandData,
+      seconds_left: commandData.seconds_left,
+      running: commandData.running
+    });
+  } catch (err) {
+    console.error("Pattern error:", err);
+    res.status(500).json({ error: err.message || "Failed to start the pattern." });
+  }
+});
+
+app.post('/api/hud/vibrate', async (req, res) => {
+  const actor = await resolveControl(req.body);
+  if (actor.error) return res.status(actor.status).json({ error: actor.error });
+  const wearer_uuid = actor.wearer;
+  const { strength, duration, toy_id, stop } = req.body;
+  if (!actor.guest) await releaseGuestRun(wearer_uuid);
 
   try {
     const session = await getSession(wearer_uuid);
@@ -1757,6 +2638,12 @@ app.post('/api/hud/vibrate', async (req, res) => {
     if (Number.isNaN(seconds)) seconds = 0;
     seconds = Math.max(0, Math.min(60, seconds));
     const stopNow = stop === true || stop === 'true';
+    const stopping = stopNow || level === 0;
+    if (actor.guest && !stopping) {
+      const limited = limitSeconds(seconds, actor);
+      if (limited.error) return res.status(limited.status).json({ error: limited.error });
+      seconds = limited.seconds;
+    }
 
     let commandData;
     if (stopNow) {
@@ -1799,8 +2686,11 @@ app.post('/api/hud/vibrate', async (req, res) => {
        WHERE sl_uuid = $1`,
       [wearer_uuid, strengthNow, holdSeconds]
     );
+    let clock = {};
+    if (actor.guest && stopping) clock = await stopGuestClock(actor, wearer_uuid);
+    else if (actor.guest) clock = await startGuestClock(actor, wearer_uuid) || {};
 
-    return res.json({ success: true, details: commandData });
+    return res.json({ success: true, details: commandData, seconds_left: clock.seconds_left, running: clock.running });
   } catch (err) {
     console.error("Vibration execution error:", err);
     res.status(500).json({ error: err.message || "Failed to transmit vibe command." });
