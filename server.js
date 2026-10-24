@@ -140,7 +140,8 @@ function toyBattery(toy) {
     : (toy.batt != null && toy.batt !== '' ? toy.batt : toy.batteryLevel);
   if (raw == null || raw === '') return null;
   const n = parseInt(raw, 10);
-  return Number.isNaN(n) ? null : Math.max(0, Math.min(100, n));
+  if (Number.isNaN(n) || n < 0) return null;
+  return Math.max(0, Math.min(100, n));
 }
 
 function listToys(connection) {
@@ -176,25 +177,66 @@ function toyLine(toys) {
   }).join(' | ');
 }
 
+function toysFromCallback(body) {
+  if (!body || typeof body !== 'object') return null;
+  if (Array.isArray(body.toyList)) {
+    const map = {};
+    for (const toy of body.toyList) {
+      if (!toy || typeof toy !== 'object') continue;
+      const id = toy.id || toy.toyId;
+      if (!id) continue;
+      const battery = toyBattery(toy);
+      map[id] = {
+        id,
+        name: toy.toyType || toy.name || 'toy',
+        nickName: toy.nickname || toy.nickName || toy.name || '',
+        status: toy.connected === false || toy.status === 0 || toy.status === '0' ? 0 : 1,
+        ...(battery == null ? {} : { battery })
+      };
+    }
+    return map;
+  }
+  return body.toys || null;
+}
+
+function collectBatteries(value, found = []) {
+  if (!value) return found;
+  if (typeof value === 'string') {
+    if (!value.includes('battery') && !value.includes('toyList')) return found;
+    try {
+      return collectBatteries(JSON.parse(value), found);
+    } catch (err) {
+      return found;
+    }
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectBatteries(item, found));
+    return found;
+  }
+  if (typeof value !== 'object') return found;
+  const battery = toyBattery(value);
+  if (battery != null && (value.id || value.toyId || value.name || value.toyType)) {
+    found.push({
+      id: value.id || value.toyId,
+      name: value.nickname || value.nickName || value.name || value.toyType,
+      battery
+    });
+  }
+  for (const child of Object.values(value)) {
+    if (child && (typeof child === 'object' || typeof child === 'string')) {
+      collectBatteries(child, found);
+    }
+  }
+  return found;
+}
+
 function toysFromCommand(data) {
+  const found = collectBatteries(data);
+  if (found.length) return found;
   if (!data) return [];
   const payload = data.data && data.data.toys ? data.data.toys : data.toys;
   if (!payload) return [];
   return listToys({ toys: payload });
-}
-
-function batteryFromCommand(data) {
-  if (!data) return null;
-  const direct = toyBattery(data) || toyBattery(data.data);
-  if (direct != null) return direct;
-  if (typeof data.data === 'number') return Math.max(0, Math.min(100, data.data));
-  if (typeof data.data === 'string' && data.data !== '' && !data.data.includes('{')) {
-    const n = parseInt(data.data, 10);
-    if (!Number.isNaN(n)) return Math.max(0, Math.min(100, n));
-  }
-  const toys = toysFromCommand(data);
-  const found = toys.find((toy) => toy.battery != null);
-  return found ? found.battery : null;
 }
 
 function mergeBattery(base, extra) {
@@ -380,29 +422,29 @@ function glideStrengths(from, to) {
   const start = Math.max(0, Math.min(20, from | 0));
   const end = Math.max(0, Math.min(20, to | 0));
   if (start === end) return [end];
-  const dir = end > start ? 1 : -1;
-  const span = [];
-  for (let value = start + dir; dir > 0 ? value <= end : value >= end; value += dir) {
-    span.push(value);
-  }
-  const repeats = Math.max(1, Math.min(3, Math.floor(50 / span.length)));
+  const span = Math.abs(end - start);
+  const slots = Math.min(50, Math.max(span, 12));
   const eased = [];
-  for (const value of span) {
-    for (let n = 0; n < repeats && eased.length < 50; n++) eased.push(value);
+  for (let i = 1; i <= slots; i++) {
+    const t = i / slots;
+    const curve = t < 0.5 ? 2 * t * t : 1 - ((-2 * t + 2) ** 2) / 2;
+    eased.push(Math.round(start + (end - start) * curve));
   }
-  while (eased.length < 12 && eased.length < 50) eased.push(end);
-  if (eased[eased.length - 1] !== end) eased.push(end);
+  eased[eased.length - 1] = end;
+  while (eased.length > 1 && eased[0] === start) eased.shift();
   return eased.slice(0, 50);
 }
 
 function fadePosition(state) {
   if (!state) return 0;
   if (!state.levels || !state.started) return state.at || 0;
-  const index = Math.min(state.levels.length - 1, Math.floor((Date.now() - state.started) / 100));
+  const stepMs = state.stepMs || 200;
+  const index = Math.min(state.levels.length - 1, Math.floor((Date.now() - state.started) / stepMs));
   return state.levels[index];
 }
 
 function cancelFade(uid) {
+  clearGlideQueue(uid);
   const state = fades.get(uid);
   if (state) state.gen += 1;
   fades.set(uid, { gen: (state?.gen || 0) + 1, at: 0, levels: null, started: 0 });
@@ -432,49 +474,41 @@ async function glideBySteps(uid, connection, toyId, levels, seconds, gen) {
     if (!state || state.gen !== gen) return last;
     const left = Math.max(1, Math.round(seconds - (Date.now() - started) / 1000));
     last = await sendToyCommand(uid, connection, functionCommand(`Vibrate:${level}`, left, toyId));
-    await new Promise((resolve) => setTimeout(resolve, 160));
+    if (!commandOk(last)) return last;
+    await new Promise((resolve) => setTimeout(resolve, 180));
   }
   return last;
 }
 
-async function sendSmoothLevel(uid, connection, toyId, target, seconds) {
+async function playGlide(uid, connection, toyId, from, target, seconds) {
   const previous = fades.get(uid);
-  const from = fadePosition(previous);
   const gen = (previous?.gen || 0) + 1;
-  if (target === 0) {
-    fades.set(uid, { gen, at: 0, target: 0, levels: null, started: 0 });
-    return sendToyCommand(uid, connection, functionCommand('Stop', 0, toyId));
-  }
-
-  const stillGliding = previous
-    && previous.target === target
-    && previous.levels
-    && previous.started
-    && (Date.now() - previous.started) < previous.levels.length * 85;
-  if (stillGliding) {
-    return { code: 200, result: true };
-  }
-
+  const stepMs = 200;
   if (target === from) {
-    fades.set(uid, { gen, at: target, target, levels: null, started: 0 });
+    fades.set(uid, { gen, at: target, target, levels: null, started: 0, stepMs });
     return sendToyCommand(uid, connection, functionCommand(`Vibrate:${target}`, seconds, toyId));
   }
 
   const levels = glideStrengths(from, target);
-  const rampMs = levels.length * 100;
-  fades.set(uid, { gen, at: target, target, levels, started: Date.now() });
+  const rampMs = Math.max(1200, levels.length * stepMs);
+  fades.set(uid, { gen, at: target, target, levels, started: Date.now(), stepMs });
 
   const pattern = {
     command: 'Pattern',
-    rule: 'V:1;F:v;S:100#',
+    rule: 'V:1;F:v;S:200#',
     strength: levels.join(';'),
     timeSec: Math.max(1.2, rampMs / 1000),
-    apiVer: 2
+    apiVer: 2,
+    stopPrevious: 1
   };
   if (toyId) pattern.toy = toyId;
-  const result = await sendToyCommand(uid, connection, pattern);
+  let result = await sendToyCommand(uid, connection, pattern);
   if (!commandOk(result)) {
     console.error('Pattern glide rejected:', result && result.code, result && result.message);
+    delete pattern.stopPrevious;
+    result = await sendToyCommand(uid, connection, pattern);
+  }
+  if (!commandOk(result)) {
     return glideBySteps(uid, connection, toyId, levels, seconds, gen);
   }
 
@@ -489,6 +523,64 @@ async function sendSmoothLevel(uid, connection, toyId, target, seconds) {
     }, rampMs);
   }
   return result;
+}
+
+const glideQueue = new Map();
+
+function clearGlideQueue(uid) {
+  const job = glideQueue.get(uid);
+  if (!job) return;
+  clearTimeout(job.timer);
+  glideQueue.delete(uid);
+  for (const resolve of job.waiters) resolve({ code: 200, result: true });
+}
+
+async function flushGlide(uid) {
+  const job = glideQueue.get(uid);
+  if (!job) return;
+  glideQueue.delete(uid);
+  try {
+    const result = await playGlide(uid, job.connection, job.toyId, job.from, job.target, job.seconds);
+    job.waiters.forEach((resolve) => resolve(result));
+  } catch (err) {
+    job.waiters.forEach((resolve) => resolve({ code: 500, message: err.message }));
+  }
+}
+
+async function sendSmoothLevel(uid, connection, toyId, target, seconds) {
+  if (target === 0) {
+    clearGlideQueue(uid);
+    const previous = fades.get(uid);
+    const gen = (previous?.gen || 0) + 1;
+    fades.set(uid, { gen, at: 0, target: 0, levels: null, started: 0, stepMs: 200 });
+    return sendToyCommand(uid, connection, functionCommand('Stop', 0, toyId));
+  }
+
+  const existing = glideQueue.get(uid);
+  if (existing) {
+    existing.target = target;
+    existing.seconds = seconds;
+    existing.toyId = toyId;
+    existing.connection = connection;
+    clearTimeout(existing.timer);
+    return new Promise((resolve) => {
+      existing.waiters.push(resolve);
+      existing.timer = setTimeout(() => flushGlide(uid), 280);
+    });
+  }
+
+  return new Promise((resolve) => {
+    const job = {
+      from: fadePosition(fades.get(uid)),
+      target,
+      seconds,
+      toyId,
+      connection,
+      waiters: [resolve],
+      timer: setTimeout(() => flushGlide(uid), 280)
+    };
+    glideQueue.set(uid, job);
+  });
 }
 
 async function getSession(slUuid) {
@@ -544,7 +636,7 @@ app.post('/api/hud/register', async (req, res) => {
       [sl_uuid, sl_http_url, utoken, sl_name || sl_uuid]
     );
 
-    const qrResponse = await fetch('https://api.lovense-api.com/api/lan/getQrCode', {
+    const qrResponse = await fetch('https://api.lovense-api.com/api/lan/v2/qrcode', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -556,23 +648,40 @@ app.post('/api/hud/register', async (req, res) => {
       })
     });
 
-    const qrData = await qrResponse.json();
-    if (!qrData.result || !qrData.data || !qrData.data.qr) {
-      console.error("Lovense getQrCode failed:", qrData);
+    let qrData = await qrResponse.json();
+    let qrImage = qrData && qrData.data && (qrData.data.qrcodeUrl || qrData.data.qr);
+    if (!qrImage) {
+      console.error('Lovense v2 qrcode failed:', qrData && qrData.code, qrData && qrData.message);
+      const legacy = await fetch('https://api.lovense-api.com/api/lan/getQrCode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: LOVENSE_TOKEN,
+          uid: sl_uuid,
+          uname: sl_name || sl_uuid,
+          utoken,
+          v: 2
+        })
+      });
+      qrData = await legacy.json();
+      qrImage = qrData && qrData.data && qrData.data.qr;
+    }
+    if (!qrImage) {
+      console.error('Lovense getQrCode failed:', qrData && qrData.code, qrData && qrData.message);
       return res.status(502).json({
         error: "Lovense did not return a QR code.",
-        details: qrData.message || qrData
+        details: (qrData && qrData.message) || "No QR image"
       });
     }
 
-    brandedQrs.set(sl_uuid, await makeBrandedQr(qrData.data.qr));
+    brandedQrs.set(sl_uuid, await makeBrandedQr(qrImage));
 
-    const pairingUrl = `${publicBase(req)}/pair/${encodeURIComponent(sl_uuid)}?qr=${encodeURIComponent(qrData.data.qr)}`;
+    const pairingUrl = `${publicBase(req)}/pair/${encodeURIComponent(sl_uuid)}?qr=${encodeURIComponent(qrImage)}`;
 
     return res.json({
       success: true,
       message: "Scan the QR code with Lovense Remote to link your toy.",
-      qr: qrData.data.qr,
+      qr: qrImage,
       pairing_url: pairingUrl,
       control_url: `${publicBase(req)}/control/${encodeURIComponent(sl_uuid)}`
     });
@@ -584,7 +693,7 @@ app.post('/api/hud/register', async (req, res) => {
 
 app.get('/api/hud/qr-proxy', async (req, res) => {
   const src = String(req.query.url || '');
-  if (!/^https:\/\/([\w.-]+\.)?lovense\.com\//i.test(src)) {
+  if (!/^https:\/\/([\w.-]+\.)?(lovense\.com|lovense-api\.com)\//i.test(src)) {
     return res.status(400).send('Invalid QR source.');
   }
   try {
@@ -847,7 +956,7 @@ app.get('/control/:sl_uuid', (req, res) => {
       sendTimer = setTimeout(() => {
         sendTimer = null;
         pump();
-      }, 180);
+      }, 320);
     }
 
     async function pump() {
@@ -1003,7 +1112,6 @@ app.get('/control/:sl_uuid', (req, res) => {
         status.textContent = (data.toys && data.toys.length)
           ? "Drag the slider from 0 to 100. It eases through the toy's 20 steps."
           : "No toys reported yet. Keep Lovense Connect open and refresh.";
-        readBattery();
       } catch (e) {
         status.textContent = "Failed to load toys.";
       }
@@ -1051,16 +1159,30 @@ app.get('/control/:sl_uuid', (req, res) => {
       }
     };
     loadToys();
-    setInterval(readBattery, 15000);
   </script>
 </body>
 </html>`);
 });
 
 app.post('/api/webhook/lovense', async (req, res) => {
-  const { uid, utoken, toys, domain, httpPort, httpsPort, wsPort, wssPort, platform, appType } = req.body;
+  const body = req.body || {};
+  let uid = body.uid || body.userId || body.uuid;
+  const utoken = body.utoken;
+  const { domain, httpPort, httpsPort, wsPort, wssPort, platform, appType } = body;
 
   try {
+    if (!uid && utoken) {
+      const byToken = await db.query(
+        'SELECT sl_uuid FROM active_sessions WHERE lovense_token = $1',
+        [utoken]
+      );
+      uid = byToken.rows[0] && byToken.rows[0].sl_uuid;
+    }
+    if (!uid) {
+      console.error('Lovense callback missing uid', Object.keys(body));
+      return res.status(400).send('Missing uid.');
+    }
+
     const userCheck = await db.query(
       'SELECT sl_http_url, lovense_token, status, toys FROM active_sessions WHERE sl_uuid = $1',
       [uid]
@@ -1079,7 +1201,17 @@ app.post('/api/webhook/lovense', async (req, res) => {
     }
 
     const previous = parseConnection(session.toys);
-    const mergedToys = preserveBattery(previous && previous.toys, toys);
+    const incomingToys = toysFromCallback(body) || (previous && previous.toys) || null;
+    let mergedToys = preserveBattery(previous && previous.toys, incomingToys);
+    if (mergedToys && typeof mergedToys === 'object' && !Array.isArray(mergedToys)) {
+      for (const item of collectBatteries(body)) {
+        if (item.battery == null) continue;
+        const key = (item.id && mergedToys[item.id] && item.id)
+          || Object.keys(mergedToys).find((id) => mergedToys[id] && (mergedToys[id].id === item.id || id === item.id));
+        if (!key || toyBattery(mergedToys[key]) != null) continue;
+        mergedToys[key] = { ...mergedToys[key], battery: item.battery };
+      }
+    }
     const connection = { toys: mergedToys, domain, httpPort, httpsPort, wsPort, wssPort, platform, appType };
     const reported = listToys(connection).map((toy) => ({
       name: toy.name,
