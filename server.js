@@ -2220,7 +2220,7 @@ app.get('/api/hud/toys/:sl_uuid', async (req, res) => {
 });
 
 function hookerNeonSign() {
-  return `<p class="ready-script">The Slut is Ready</p><aside class="neon-sign" aria-hidden="true"><img src="/neon-sign.png" alt=""></aside>`;
+  return `<p class="ready-script">The Slut is Ready</p><aside class="neon-sign" aria-hidden="true"><img src="/neon-sign.png?v=beach" alt=""></aside>`;
 }
 
 function ageGate() {
