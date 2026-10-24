@@ -1544,23 +1544,24 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
       background-clip: text;
       color: transparent;
     }
-    label, select, input, button { display: block; width: 100%; margin: 8px 0; font-size: 16px; }
-    select, input { padding: 8px; border-radius: 6px; border: 0; }
-    button { padding: 12px; border: 0; border-radius: 8px; background: #ff4da6; color: #fff; font-weight: bold; }
+    p { font-size: 13px; margin: 6px 0; }
+    label, select, input, button { display: block; width: 100%; margin: 5px 0; font-size: 13px; }
+    select, input { padding: 5px 8px; border-radius: 6px; border: 0; }
+    button { padding: 7px 10px; border: 0; border-radius: 8px; background: #ff4da6; color: #fff; font-weight: bold; }
     button.secondary { background: #444; }
-    h2 { font-size: 16px; margin: 18px 0 4px; }
-    .pattern-note { margin: 0 0 8px; color: #ccc; font-size: 14px; }
-    .patterns { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    h2 { font-size: 13px; margin: 12px 0 2px; }
+    .pattern-note { margin: 0 0 6px; color: #ccc; font-size: 12px; }
+    .patterns { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
     .patterns button { margin: 0; background: #6b2d78; }
     #builder[hidden] { display: none; }
-    #bars { display: grid; grid-template-columns: repeat(16, 1fr); gap: 3px; height: 140px; margin: 8px 0; touch-action: none; }
+    #bars { display: grid; grid-template-columns: repeat(16, 1fr); gap: 3px; height: 110px; margin: 6px 0; touch-action: none; }
     #bars button { margin: 0; padding: 0; height: 100%; background: #2a2a2a; position: relative; overflow: hidden; border-radius: 4px; }
     #bars button span { position: absolute; left: 0; right: 0; bottom: 0; background: linear-gradient(#ff8a1e, #ff3d6e); pointer-events: none; }
     #playDraft { background: #6b2d78; }
-    .saved { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
-    .saved-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+    .saved { display: flex; flex-direction: column; gap: 6px; margin-bottom: 6px; }
+    .saved-row { display: grid; grid-template-columns: 1fr auto; gap: 6px; }
     .saved-row button { margin: 0; }
-    .saved-row .remove { width: auto; background: #444; padding: 12px 14px; }
+    .saved-row .remove { width: auto; background: #444; padding: 7px 10px; }
     #status { min-height: 24px; color: #9f9; }
     .sender { margin: 2px 0 0; font-size: 22px; font-weight: bold; color: #ffe08a; }
     [hidden] { display: none !important; }
