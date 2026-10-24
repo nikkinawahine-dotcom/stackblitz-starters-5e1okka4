@@ -153,6 +153,16 @@ async function ensureSchema() {
     bytes BYTEA NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
+  await db.query(`CREATE TABLE IF NOT EXISTS time_adds (
+    id TEXT PRIMARY KEY,
+    wearer_uuid TEXT NOT NULL,
+    recipient_uuid TEXT NOT NULL,
+    minutes INTEGER NOT NULL,
+    price INTEGER NOT NULL,
+    rate INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
   await db.query(`UPDATE control_grants
     SET seconds_left = GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (expires_at - NOW())))::int)
     WHERE seconds_left IS NULL`);
@@ -1928,6 +1938,110 @@ app.post('/api/hud/offer/extend', async (req, res) => {
   }
 });
 
+app.post('/api/hud/grant/:token/add', async (req, res) => {
+  const minutes = Math.min(60, Math.max(1, parseInt(req.body.minutes, 10) || 0));
+  if (!minutes) return res.status(400).json({ error: "Pick how many minutes." });
+  try {
+    const grant = await db.query(
+      `SELECT token, wearer_uuid, recipient_uuid, rate, hud_mode
+       FROM control_grants WHERE token = $1`,
+      [String(req.params.token || '')]
+    );
+    if (!grant.rows.length) return res.status(404).json({ error: "This control link is not valid." });
+    const row = grant.rows[0];
+    if (hudMode(row.hud_mode) !== 'hooker') return res.status(400).json({ error: "More time is only for this page." });
+    const rate = Math.max(1, Number(row.rate) || LINDENS_PER_MINUTE);
+    const price = minutes * rate;
+    const id = crypto.randomBytes(9).toString('hex');
+    await db.query(
+      `UPDATE time_adds SET status = 'replaced'
+       WHERE wearer_uuid = $1 AND recipient_uuid = $2 AND status = 'pending'`,
+      [row.wearer_uuid, row.recipient_uuid]
+    );
+    await db.query(
+      `INSERT INTO time_adds (id, wearer_uuid, recipient_uuid, minutes, price, rate)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [id, row.wearer_uuid, row.recipient_uuid, minutes, price, rate]
+    );
+    return res.json({ id, minutes, price, rate, label: offerLabel(minutes * 60) });
+  } catch (err) {
+    console.error("Add time request error:", err);
+    res.status(500).json({ error: "Could not send that choice." });
+  }
+});
+
+app.get('/api/hud/add-request', async (req, res) => {
+  const wearer = String(req.query.sl_uuid || '');
+  if (!wearer) return res.status(400).json({ error: "Missing avatar." });
+  try {
+    const found = await db.query(
+      `SELECT id, recipient_uuid, minutes, price, rate
+       FROM time_adds
+       WHERE wearer_uuid = $1 AND status = 'pending'
+         AND created_at > NOW() - INTERVAL '15 minutes'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [wearer]
+    );
+    if (!found.rows.length) return res.json({ id: "" });
+    const row = found.rows[0];
+    return res.json({
+      id: row.id,
+      recipient_uuid: row.recipient_uuid,
+      minutes: Number(row.minutes),
+      price: Number(row.price),
+      rate: Number(row.rate),
+      label: offerLabel(Number(row.minutes) * 60)
+    });
+  } catch (err) {
+    console.error("Add request lookup error:", err);
+    res.status(500).json({ error: "Could not read the time choice." });
+  }
+});
+
+app.post('/api/hud/add-request/confirm', async (req, res) => {
+  const wearer = String(req.body.sl_uuid || '');
+  const requestId = String(req.body.request_id || '');
+  if (!wearer || !requestId) return res.status(400).json({ error: "Missing time choice." });
+  try {
+    const found = await db.query(
+      `SELECT * FROM time_adds
+       WHERE id = $1 AND wearer_uuid = $2 AND status = 'pending'
+         AND created_at > NOW() - INTERVAL '15 minutes'`,
+      [requestId, wearer]
+    );
+    if (!found.rows.length) return res.status(404).json({ error: "That time choice is no longer open." });
+    const add = found.rows[0];
+    const grant = await db.query(
+      `SELECT token FROM control_grants
+       WHERE wearer_uuid = $1 AND recipient_uuid = $2 AND hud_mode = 'hooker'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [wearer, add.recipient_uuid]
+    );
+    if (!grant.rows.length) return res.status(404).json({ error: "No paid time to add to." });
+    const added = Number(add.minutes) * 60;
+    const updated = await db.query(
+      `UPDATE control_grants
+       SET seconds_left = COALESCE(seconds_left, 0) + $2,
+           rate = $3
+       WHERE token = $1
+       RETURNING seconds_left, running_since`,
+      [grant.rows[0].token, added, Number(add.rate)]
+    );
+    await db.query(`UPDATE time_adds SET status = 'confirmed' WHERE id = $1`, [requestId]);
+    return res.json({
+      success: true,
+      seconds_added: added,
+      seconds_left: grantRemaining(updated.rows[0]),
+      label: offerLabel(added)
+    });
+  } catch (err) {
+    console.error("Add time confirm error:", err);
+    res.status(500).json({ error: "Could not add the time." });
+  }
+});
+
 app.post('/api/hud/offer/decline', async (req, res) => {
   const wearer = String(req.body.sl_uuid || '');
   const offerId = String(req.body.offer_id || '');
@@ -2019,13 +2133,28 @@ app.get('/api/hud/grant/:token', async (req, res) => {
       `SELECT id, name FROM saved_patterns WHERE sl_uuid = $1 ORDER BY created_at ASC, id ASC`,
       [actor.wearer]
     );
+    let pendingAdd = null;
+    if (actor.guest && actor.hudMode === 'hooker') {
+      const pending = await db.query(
+        `SELECT minutes, price FROM time_adds
+         WHERE wearer_uuid = $1 AND status = 'pending'
+           AND created_at > NOW() - INTERVAL '15 minutes'
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [actor.wearer]
+      );
+      if (pending.rows[0]) {
+        pendingAdd = { minutes: Number(pending.rows[0].minutes), price: Number(pending.rows[0].price) };
+      }
+    }
     return res.json({
       toys,
       patterns: patterns.rows,
       seconds_left: actor.secondsLeft,
       running: actor.running,
       rate: actor.rate || LINDENS_PER_MINUTE,
-      owner_name: actor.senderName || session.display_name || ''
+      owner_name: actor.senderName || session.display_name || '',
+      pending_add: pendingAdd
     });
   } catch (err) {
     console.error(err);
@@ -2091,7 +2220,7 @@ app.get('/api/hud/toys/:sl_uuid', async (req, res) => {
 });
 
 function hookerNeonSign() {
-  return `<aside class="neon-sign" aria-hidden="true"><img src="/neon-sign.png" alt=""></aside>`;
+  return `<p class="ready-script">The Slut is Ready</p><aside class="neon-sign" aria-hidden="true"><img src="/neon-sign.png" alt=""></aside>`;
 }
 
 function ageGate() {
@@ -2134,7 +2263,7 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
   <title>${ownerName ? "Control " + ownerName.replace(/[&<>"]/g, "") + " — Hot Hawaiian Nights" : "Hot Hawaiian Nights"}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Pacifico&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Great+Vibes&family=Pacifico&display=swap" rel="stylesheet">
   <style>
     body { font-family: sans-serif; background: #111; color: #eee; max-width: 420px; margin: 0 auto; padding: 24px; }
     .brand { display: flex; align-items: center; gap: 14px; margin: 0 0 8px; }
@@ -2158,6 +2287,8 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
     h2 { font-size: 13px; margin: 12px 0 2px; }
     .pattern-note { margin: 0 0 6px; color: #ccc; font-size: 12px; }
     .patterns { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .add-custom { display: grid; grid-template-columns: 1fr auto; gap: 6px; margin-top: 6px; }
+    .add-custom input, .add-custom button { margin: 0; }
     .patterns button { margin: 0; background: #6b2d78; }
     #builder[hidden] { display: none; }
     #bars { display: grid; grid-template-columns: repeat(16, 1fr); gap: 3px; height: 110px; margin: 6px 0; touch-action: none; }
@@ -2180,6 +2311,13 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
     body.hooker #status { color: #ffd0dc; }
     body.hooker .brand { position: relative; min-height: 118px; padding-right: 132px; }
     body.hooker .brand > img, body.hooker .brand h1 { position: relative; z-index: 1; }
+    body.hooker .ready-script {
+      position: absolute; z-index: 2; left: 188px; top: 50%; margin: 0;
+      transform: translateY(-54%) rotate(-8deg);
+      font-family: "Great Vibes", cursive; font-size: 30px; line-height: 1; font-weight: 400;
+      white-space: nowrap; pointer-events: none; color: #fff6fb;
+      text-shadow: 0 0 6px #ff4da6, 0 0 16px #ff2a78, 0 0 28px #ff4df0, 0 2px 0 #4a0018;
+    }
     body.hooker .neon-sign {
       position: absolute; z-index: 0; top: 50%; right: -28px; width: 210px; margin: 0;
       transform: translateY(-48%); pointer-events: none;
@@ -2222,6 +2360,11 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
   <button type="button" id="hudMode" class="secondary">Normal HUD</button>
   <p id="grantLine" class="pattern-note"></p>
   <p id="addTime" class="pattern-note" hidden></p>
+  <div id="addMinutes" class="patterns" hidden></div>
+  <div id="addCustom" class="add-custom" hidden>
+    <input id="addCustomMinutes" type="number" min="1" max="60" step="1" inputmode="numeric" placeholder="Minutes">
+    <button type="button" id="addCustomSend">Send</button>
+  </div>
   <label id="toyLabel" for="toy">Toy</label>
   <select id="toy"><option value="">All connected toys</option></select>
   <p id="toyFns" class="pattern-note"></p>
@@ -2260,6 +2403,11 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
     const guestToken = ${JSON.stringify(guestToken || "")};
     const guestEnds = ${Number(guestEnds) || 0};
     let ownerName = ${JSON.stringify(ownerName || "")};
+    function awaitingLine(price) {
+      const who = ownerName || "her";
+      if (price) return "Awaiting confirmation from " + who + ". Pay L$" + price + " in Second Life.";
+      return "Awaiting confirmation from " + who + ".";
+    }
     let grantLeft = ${Number(grantSeconds) || 0};
     let grantRunning = ${grantRunning ? "true" : "false"};
     let grantSync = Date.now();
@@ -2978,16 +3126,22 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
       const clockText = mins + ":" + (secs < 10 ? "0" : "") + secs;
       if (left <= 0) {
         line.textContent = pageMode === "hooker"
-          ? "Clock is at 0:00. Pay her collar to add time."
+          ? "Clock is at 0:00. Pay her to add time."
           : "Control time is used up.";
-        status.textContent = pageMode === "hooker"
-          ? "Pay her collar to add time."
-          : "Control time is used up.";
-        document.querySelectorAll("button, input, select").forEach((el) => { el.disabled = true; });
+        if (status.dataset.awaiting !== "1") {
+          status.textContent = pageMode === "hooker"
+            ? "Pay her to add time."
+            : "Control time is used up.";
+        }
+        document.querySelectorAll("button, input, select").forEach((el) => {
+          if (!el.closest("#addMinutes") && !el.closest("#addCustom")) el.disabled = true;
+        });
         return;
       }
-      document.querySelectorAll("button, input, select").forEach((el) => { el.disabled = false; });
-      if (pageMode === "hooker" && status.textContent === "Pay her collar to add time.") {
+      document.querySelectorAll("button, input, select").forEach((el) => {
+        if (!el.closest("#addMinutes") && !el.closest("#addCustom")) el.disabled = false;
+      });
+      if (pageMode === "hooker" && status.textContent === "Pay her to add time.") {
         status.textContent = "Drag it. She stays on.";
       }
       line.textContent = pageMode === "hooker"
@@ -3035,17 +3189,77 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
         document.getElementById("mineNote").textContent = "What she saved.";
         document.getElementById("stop").textContent = "Hold up";
         const addTime = document.getElementById("addTime");
+        const addMinutes = document.getElementById("addMinutes");
         addTime.hidden = false;
-        addTime.textContent = "Pay her collar to add time. L$" + payRate + " a minute.";
+        addTime.textContent = "Pick more minutes. Second Life asks you to pay that amount, then she confirms.";
+        addMinutes.hidden = false;
+        const addCustom = document.getElementById("addCustom");
+        const addCustomMinutes = document.getElementById("addCustomMinutes");
+        async function sendMinutes(mins) {
+          status.textContent = "Sending " + mins + " minutes to Second Life.";
+          try {
+            const response = await fetch("/api/hud/grant/" + encodeURIComponent(guestToken) + "/add", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ minutes: mins })
+            });
+            const result = await response.json();
+            if (!response.ok) {
+              status.textContent = (result && result.error) || "Could not send that.";
+              return;
+            }
+            status.dataset.awaiting = "1";
+            status.textContent = awaitingLine(result.price);
+            addTime.textContent = awaitingLine();
+          } catch (err) {
+            status.textContent = "Could not send that.";
+          }
+        }
+        if (!addMinutes.dataset.ready) {
+          addMinutes.dataset.ready = "1";
+          [1, 5, 10, 30].forEach((mins) => {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.textContent = mins + " min";
+            button.onclick = () => sendMinutes(mins);
+            addMinutes.appendChild(button);
+          });
+          const other = document.createElement("button");
+          other.type = "button";
+          other.textContent = "Other";
+          other.onclick = () => {
+            addCustom.hidden = false;
+            addCustomMinutes.focus();
+          };
+          addMinutes.appendChild(other);
+          document.getElementById("addCustomSend").onclick = () => {
+            const mins = Math.round(Number(addCustomMinutes.value));
+            if (!mins || mins < 1 || mins > 60) {
+              status.textContent = "Type 1 to 60 minutes.";
+              return;
+            }
+            sendMinutes(mins);
+          };
+          addCustomMinutes.addEventListener("keydown", (event) => {
+            if (event.key === "Enter") document.getElementById("addCustomSend").click();
+          });
+        }
         setInterval(() => {
           fetch("/api/hud/grant/" + encodeURIComponent(guestToken))
             .then((r) => r.json())
             .then((data) => {
               if (data && data.seconds_left != null) applyGrant(data);
               if (data && data.toys) showToys(data.toys);
-              if (data && data.rate) {
+              if (data && data.pending_add) {
+                status.dataset.awaiting = "1";
+                status.textContent = awaitingLine(data.pending_add.price);
                 addTime.hidden = false;
-                addTime.textContent = "Pay her collar to add time. L$" + data.rate + " a minute.";
+                addTime.textContent = awaitingLine();
+              } else if (data && data.rate) {
+                if (status.dataset.awaiting === "1") status.textContent = "Drag it. She stays on.";
+                delete status.dataset.awaiting;
+                addTime.hidden = false;
+                addTime.textContent = "Pick more minutes at L$" + data.rate + " each. Second Life asks you to pay that amount, then she confirms.";
               }
             })
             .catch(() => {});
@@ -3090,10 +3304,18 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
           .then((r) => r.json())
           .then((data) => {
             if (data && data.seconds_left != null) applyGrant(data);
-            if (data && data.rate && pageMode === "hooker") {
+            if (pageMode === "hooker" && data && data.pending_add) {
               const addTime = document.getElementById("addTime");
+              status.dataset.awaiting = "1";
+              status.textContent = awaitingLine(data.pending_add.price);
               addTime.hidden = false;
-              addTime.textContent = "Pay her collar to add time. L$" + data.rate + " a minute.";
+              addTime.textContent = awaitingLine();
+            } else if (data && data.rate && pageMode === "hooker") {
+              const addTime = document.getElementById("addTime");
+              if (status.dataset.awaiting === "1") status.textContent = "Drag it. She stays on.";
+              delete status.dataset.awaiting;
+              addTime.hidden = false;
+              addTime.textContent = "Pick more minutes at L$" + data.rate + " each. Second Life asks you to pay that amount, then she confirms.";
             }
             else if (data && data.error) {
               grantLeft = 0;
