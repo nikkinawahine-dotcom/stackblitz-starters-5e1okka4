@@ -829,6 +829,8 @@ app.get('/control/:sl_uuid', (req, res) => {
       if (level > 0) beginSession();
       else stopClock();
       queueSend();
+    };
+
     function stopClock() {
       if (clock) clearInterval(clock);
       clock = null;
