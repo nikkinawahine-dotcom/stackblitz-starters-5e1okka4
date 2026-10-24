@@ -183,6 +183,69 @@ function toyBattery(toy) {
   return Math.max(0, Math.min(100, n));
 }
 
+const FUNCTION_ORDER = ['Vibrate', 'Vibrate1', 'Vibrate2', 'Vibrate3', 'Rotate', 'Pump', 'Thrusting', 'Fingering', 'Suction', 'Depth', 'Oscillate', 'Stroke', 'Position'];
+const FUNCTION_LIMITS = {
+  Vibrate: 20, Vibrate1: 20, Vibrate2: 20, Vibrate3: 20,
+  Rotate: 20, Pump: 3, Thrusting: 20, Fingering: 20, Suction: 20,
+  Depth: 3, Oscillate: 20, Stroke: 100, Position: 100
+};
+const FUNCTION_ALIASES = {
+  v: 'Vibrate', vibrate: 'Vibrate',
+  v1: 'Vibrate1', vibrate1: 'Vibrate1',
+  v2: 'Vibrate2', vibrate2: 'Vibrate2',
+  v3: 'Vibrate3', vibrate3: 'Vibrate3',
+  r: 'Rotate', rotate: 'Rotate',
+  p: 'Pump', pump: 'Pump',
+  t: 'Thrusting', thrusting: 'Thrusting', thrust: 'Thrusting',
+  f: 'Fingering', fingering: 'Fingering',
+  s: 'Suction', suction: 'Suction',
+  d: 'Depth', depth: 'Depth',
+  o: 'Oscillate', oscillate: 'Oscillate',
+  stroke: 'Stroke',
+  position: 'Position', pos: 'Position'
+};
+const MODEL_FUNCTIONS = [
+  [/solace\s*pro|solacepro/, ['Thrusting', 'Stroke', 'Position']],
+  [/solace/, ['Thrusting', 'Depth']],
+  [/nora/, ['Vibrate', 'Rotate']],
+  [/max/, ['Vibrate', 'Pump']],
+  [/tenera/, ['Suction']],
+  [/flexer/, ['Fingering']],
+  [/gravity/, ['Vibrate', 'Thrusting', 'Depth']],
+  [/sex\s*machine|xmachine/, ['Thrusting']],
+  [/osci/, ['Oscillate']]
+];
+
+function asFunctionList(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== 'string') return [];
+  const trimmed = value.trim();
+  if (!trimmed) return [];
+  if (trimmed.startsWith('[')) {
+    try { return asFunctionList(JSON.parse(trimmed)); } catch (err) { /* fall through */ }
+  }
+  return trimmed.split(/[,\s]+/);
+}
+
+function knownFunctions(value) {
+  const names = [];
+  for (const item of asFunctionList(value)) {
+    const name = FUNCTION_ALIASES[String(item || '').trim().toLowerCase()];
+    if (name && !names.includes(name)) names.push(name);
+  }
+  return FUNCTION_ORDER.filter((name) => names.includes(name));
+}
+
+function functionsForToy(toy) {
+  const reported = knownFunctions(toy && (toy.fullFunctionNames || toy.functions || toy.shortFunctionNames));
+  if (reported.length) return reported;
+  const model = String((toy && (toy.toyType || toy.type || toy.name)) || '').toLowerCase();
+  for (const [pattern, functions] of MODEL_FUNCTIONS) {
+    if (pattern.test(model)) return functions.slice();
+  }
+  return ['Vibrate'];
+}
+
 function listToys(connection) {
   if (!connection || !connection.toys) return [];
   let toys = connection.toys;
@@ -199,7 +262,8 @@ function listToys(connection) {
     type: toy.name || 'toy',
     name: toy.nickName || toy.name || toy.id,
     status: toy.status,
-    battery: toyBattery(toy)
+    battery: toyBattery(toy),
+    functions: functionsForToy(toy)
   }));
 }
 
@@ -230,6 +294,12 @@ function toysFromCallback(body) {
         name: toy.toyType || toy.name || 'toy',
         nickName: toy.nickname || toy.nickName || toy.name || '',
         status: toy.connected === false || toy.status === 0 || toy.status === '0' ? 0 : 1,
+        fullFunctionNames: functionsForToy({
+          fullFunctionNames: toy.fullFunctionNames,
+          shortFunctionNames: toy.shortFunctionNames,
+          toyType: toy.toyType || toy.name
+        }),
+        functionsKnown: knownFunctions(toy.fullFunctionNames || toy.shortFunctionNames).length > 0,
         ...(battery == null ? {} : { battery })
       };
     }
@@ -280,24 +350,45 @@ function toysFromCommand(data) {
 
 function mergeBattery(base, extra) {
   if (!extra || !extra.length) return base;
-  const byId = new Map(extra.filter((toy) => toy.id).map((toy) => [toy.id, toy]));
-  const only = extra.length === 1 && base.length === 1 ? extra[0] : null;
   if (!base.length) return extra;
+  const byId = new Map(extra.filter((toy) => toy.id).map((toy) => [String(toy.id), toy]));
   return base.map((toy) => {
-    const live = byId.get(toy.id)
-      || extra.find((item) => item.id && item.id === toy.id)
-      || extra.find((item) => item.name && toy.name && String(item.name).toLowerCase() === String(toy.name).toLowerCase())
-      || only;
+    const live = (toy.id && byId.get(String(toy.id)))
+      || extra.find((item) => item.name && toy.name && String(item.name).toLowerCase() === String(toy.name).toLowerCase());
     if (!live) return toy;
     return {
       ...toy,
-      name: live.name || toy.name,
-      battery: live.battery != null ? live.battery : toy.battery
+      name: toy.name || live.name,
+      battery: live.battery != null ? live.battery : toy.battery,
+      functions: (live.functions && live.functions.length) ? live.functions : toy.functions
     };
   });
 }
 
 const batteryCache = new Map();
+
+async function replaceStoredToys(session, toys) {
+  if (!session || !session.connection || !toys.length) return;
+  const toysObj = {};
+  for (const toy of toys) {
+    const id = toy.id || toy.name;
+    if (!id) continue;
+    toysObj[id] = {
+      id,
+      name: toy.type || toy.name || 'toy',
+      nickName: toy.name || '',
+      status: 1,
+      fullFunctionNames: functionsForToy(toy),
+      ...(toy.battery == null ? {} : { battery: toy.battery })
+    };
+  }
+  if (!Object.keys(toysObj).length) return;
+  const connection = { ...session.connection, toys: toysObj };
+  await db.query(
+    'UPDATE active_sessions SET toys = $2 WHERE sl_uuid = $1',
+    [session.sl_uuid, JSON.stringify(connection)]
+  );
+}
 
 async function rememberBatteries(session, toys) {
   if (!session || !session.connection || !session.connection.toys || !toys.some((toy) => toy.battery != null)) {
@@ -310,9 +401,27 @@ async function rememberBatteries(session, toys) {
   for (const toy of toys) {
     if (toy.battery == null) continue;
     let key = Object.keys(toysObj).find((id) => id === toy.id || (toysObj[id] && toysObj[id].id === toy.id));
-    if (!key && Object.keys(toysObj).length === 1) key = Object.keys(toysObj)[0];
-    if (!key || toysObj[key].battery === toy.battery) continue;
-    toysObj[key] = { ...toysObj[key], battery: toy.battery };
+    if (!key && !toy.id && Object.keys(toysObj).length === 1) key = Object.keys(toysObj)[0];
+    if (!key) {
+      const id = toy.id || toy.name;
+      if (!id) continue;
+      toysObj[id] = {
+        id,
+        name: toy.type || toy.name || 'toy',
+        nickName: toy.name || '',
+        status: 1,
+        battery: toy.battery,
+        ...(toy.functions && toy.functions.length ? { fullFunctionNames: toy.functions } : {})
+      };
+      changed = true;
+      continue;
+    }
+    const next = { ...toysObj[key], battery: toy.battery };
+    if (toy.functions && toy.functions.length) next.fullFunctionNames = toy.functions;
+    const sameBattery = toysObj[key].battery === toy.battery;
+    const sameFns = JSON.stringify(toysObj[key].fullFunctionNames || []) === JSON.stringify(next.fullFunctionNames || []);
+    if (sameBattery && sameFns) continue;
+    toysObj[key] = next;
     changed = true;
   }
   if (!changed) return;
@@ -325,25 +434,71 @@ async function rememberBatteries(session, toys) {
 
 const getToysAt = new Map();
 
+function toyRecord(value) {
+  if (!value) return null;
+  if (typeof value === 'string') {
+    try { return toyRecord(JSON.parse(value)); } catch (err) { return null; }
+  }
+  if (typeof value !== 'object' || Array.isArray(value)) return null;
+  return value;
+}
+
+function readReportedToys(data) {
+  const root = data && data.data && typeof data.data === 'object' ? data.data : data;
+  let payload = root && root.toys != null ? root.toys : null;
+  if (typeof payload === 'string') {
+    try { payload = JSON.parse(payload); } catch (err) { payload = null; }
+  }
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return [];
+  const toys = [];
+  for (const value of Object.values(payload)) {
+    const toy = toyRecord(value);
+    if (!toy) continue;
+    const id = toy.id || toy.toyId;
+    if (!id) continue;
+    toys.push({
+      id,
+      name: toy.nickName || toy.nickname || toy.name || id,
+      type: toy.name || toy.toyType || 'toy',
+      battery: toyBattery(toy),
+      functions: functionsForToy({
+        fullFunctionNames: toy.fullFunctionNames,
+        shortFunctionNames: toy.shortFunctionNames,
+        toyType: toy.name || toy.toyType
+      })
+    });
+  }
+  return toys;
+}
+
 function scheduleGetToys(session) {
   const uid = session.sl_uuid;
   if (Date.now() - (getToysAt.get(uid) || 0) < 60000) return;
   getToysAt.set(uid, Date.now());
   sendLovenseCommand(uid, { command: 'GetToys', apiVer: 1 })
     .then(async (live) => {
-      const parsed = toysFromCommand(live);
-      if (!parsed.some((toy) => toy.battery != null)) {
+      const reported = readReportedToys(live);
+      const parsed = reported.length ? reported : toysFromCommand(live);
+      if (!parsed.length) {
         const data = live && live.data;
         const keys = data && typeof data === 'object' ? Object.keys(data) : [];
-        console.log('GetToys had no battery', live && live.code, keys.join(','));
+        console.log('GetToys had no toys', live && live.code, keys.join(','));
         return;
       }
       const fresh = await getSession(uid);
       if (!fresh || fresh.status !== 'connected') return;
-      const toys = mergeBattery(listToys(fresh.connection), parsed);
+      const previous = listToys(fresh.connection);
+      const toys = parsed.map((toy) => {
+        const old = previous.find((item) => item.id && toy.id && String(item.id) === String(toy.id));
+        return {
+          ...toy,
+          battery: toy.battery != null ? toy.battery : (old && old.battery != null ? old.battery : null),
+          functions: (toy.functions && toy.functions.length) ? toy.functions : (old && old.functions)
+        };
+      });
       batteryCache.set(uid, { at: Date.now(), toys });
-      await rememberBatteries(fresh, toys);
-      console.log('Lovense battery', toys.map((toy) => ({ name: toy.name, battery: toy.battery })));
+      await replaceStoredToys(fresh, toys);
+      console.log('Lovense toys', toys.map((toy) => ({ name: toy.type || toy.name, battery: toy.battery, functions: toy.functions })));
     })
     .catch((err) => console.error('GetToys for titler failed:', err.message));
 }
@@ -353,7 +508,7 @@ async function toysForSession(session) {
   let toys = listToys(session.connection);
   const cached = batteryCache.get(session.sl_uuid);
   if (cached) toys = mergeBattery(toys, cached.toys);
-  if (toys.some((toy) => toy.battery == null)) scheduleGetToys(session);
+  scheduleGetToys(session);
   return toys;
 }
 
@@ -583,9 +738,21 @@ function preserveBattery(previousToys, incomingToys) {
   for (const [id, toy] of Object.entries(copy)) {
     if (!toy || typeof toy !== 'object') continue;
     const old = prev[id] || Object.values(prev).find((item) => item && item.id === (toy.id || id));
-    if (old && toyBattery(toy) == null && toyBattery(old) != null) {
-      copy[id] = { ...toy, battery: toyBattery(old) };
+    if (!old) continue;
+    const patch = { ...toy };
+    let changed = false;
+    if (toyBattery(toy) == null && toyBattery(old) != null) {
+      patch.battery = toyBattery(old);
+      changed = true;
     }
+    if ((!toy.fullFunctionNames || !toy.fullFunctionNames.length) && old.fullFunctionNames && old.fullFunctionNames.length) {
+      patch.fullFunctionNames = old.fullFunctionNames;
+      changed = true;
+    } else if (!toy.functionsKnown && old.fullFunctionNames && old.fullFunctionNames.length) {
+      patch.fullFunctionNames = old.fullFunctionNames;
+      changed = true;
+    }
+    if (changed) copy[id] = patch;
   }
   return copy;
 }
@@ -679,6 +846,32 @@ function percentToLevel(percent) {
   const p = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
   if (p <= 0) return 0;
   return Math.max(1, Math.round((p * 20) / 100));
+}
+
+function scaledLevel(name, percent) {
+  const max = FUNCTION_LIMITS[name] || 20;
+  const p = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
+  if (p <= 0) return 0;
+  if (max === 100) return p;
+  return Math.max(1, Math.round((p * max) / 100));
+}
+
+function levelsToCommand(levels) {
+  const scaled = {};
+  for (const name of FUNCTION_ORDER) {
+    if (!Object.prototype.hasOwnProperty.call(levels, name)) continue;
+    scaled[name] = scaledLevel(name, levels[name]);
+  }
+  const parts = [];
+  for (const name of FUNCTION_ORDER) {
+    if (name === 'Stroke' || name === 'Position') continue;
+    if (scaled[name] > 0) parts.push(`${name}:${scaled[name]}`);
+  }
+  if (scaled.Stroke > 0 && (scaled.Thrusting > 0 || !parts.length)) {
+    if (!parts.some((part) => part.startsWith('Thrusting:'))) parts.push('Thrusting:1');
+    parts.push(`Stroke:0-${Math.max(20, scaled.Stroke)}`);
+  }
+  return { action: parts.join(','), position: scaled.Position > 0 ? scaled.Position : 0 };
 }
 
 function glideStrengths(from, to) {
@@ -1829,6 +2022,7 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
     #bars { display: grid; grid-template-columns: repeat(16, 1fr); gap: 3px; height: 110px; margin: 6px 0; touch-action: none; }
     #bars button { margin: 0; padding: 0; height: 100%; background: #2a2a2a; position: relative; overflow: hidden; border-radius: 4px; }
     #bars button span { position: absolute; left: 0; right: 0; bottom: 0; background: linear-gradient(#ff8a1e, #ff3d6e); pointer-events: none; }
+    #toyFns { margin-top: 0; }
     #playDraft { background: #6b2d78; }
     .saved { display: flex; flex-direction: column; gap: 6px; margin-bottom: 6px; }
     .saved-row { display: grid; grid-template-columns: 1fr auto; gap: 6px; }
@@ -1858,14 +2052,16 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
   <p id="addTime" class="pattern-note" hidden></p>
   <label id="toyLabel" for="toy">Toy</label>
   <select id="toy"><option value="">All connected toys</option></select>
+  <p id="toyFns" class="pattern-note"></p>
   <label id="strengthLabel" for="strength">Vibration 0–100: <span id="strengthVal">0</span></label>
   <input id="strength" type="range" min="0" max="100" step="1" value="0">
+  <div id="extraControls"></div>
   <label id="secondsLabel" for="duration">Seconds</label>
   <input id="duration" type="number" min="1" max="60" value="5">
   <button id="vibrate">Vibrate for those seconds</button>
   <h2 id="presetHeading">Vibration patterns</h2>
   <p id="presetNote" class="pattern-note">Lovense patterns for Connect and Remote. They run for the seconds above.</p>
-  <div class="patterns">
+  <div id="presetButtons" class="patterns">
     <button type="button" data-pattern="pulse">Pulse</button>
     <button type="button" data-pattern="wave">Wave</button>
     <button type="button" data-pattern="fireworks">Fireworks</button>
@@ -1919,6 +2115,10 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
     let sendTimer = null;
     let sendImmediate = false;
     let localCommand = "";
+    let loadedToys = [];
+    let shownFns = "";
+    let lastLevels = "";
+    let wasMulti = false;
 
     function toyStep(percent) {
       const p = Math.max(0, Math.min(100, percent));
@@ -1944,6 +2144,8 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
         sendImmediate = false;
         desired = 0;
         lastSent = 0;
+        lastLevels = "";
+        wasMulti = false;
         postCommand(commandBody(0, 0, true)).catch((e) => {
           lastSent = -1;
           status.textContent = e.message || "Command failed.";
@@ -1954,6 +2156,32 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
       if (sendTimer) return;
       sendTimer = setTimeout(() => {
         sendTimer = null;
+        const levels = collectLevels();
+        if (multiOn(levels)) {
+          const left = remaining();
+          if (left <= 0) return;
+          const signature = JSON.stringify(levels) + "|" + (toySelect.value || "");
+          if (signature === lastLevels) return;
+          lastLevels = signature;
+          wasMulti = true;
+          lastSent = -1;
+          postCommand(withActor({
+            levels: levels,
+            duration: left,
+            stop: false,
+            toy_id: toySelect.value || undefined
+          })).catch((e) => {
+            lastLevels = "";
+            status.textContent = e.message || "Command failed.";
+          });
+          status.textContent = "Controls sent.";
+          return;
+        }
+        if (wasMulti) {
+          wasMulti = false;
+          lastSent = -1;
+          lastLevels = "";
+        }
         const level = desired;
         const step = toyStep(level);
         const left = level === 0 ? 0 : remaining();
@@ -1976,9 +2204,10 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
       const level = parseInt(strength.value, 10) || 0;
       strengthVal.textContent = String(level);
       desired = level;
-      if (level > 0) beginSession();
+      const levels = collectLevels();
+      if (levelsOn(levels)) beginSession();
       else stopClock();
-        queueSend();
+      queueSend(false);
     };
 
     function stopClock() {
@@ -1997,6 +2226,7 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
         stopClock();
         strength.value = "0";
         strengthVal.textContent = "0";
+        zeroExtras();
         desired = 0;
         status.textContent = guestToken
           ? "Paused. You can start again with the time left."
@@ -2042,12 +2272,156 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
         opt.textContent = toyLabel(toy);
         toySelect.appendChild(opt);
       });
-      if (selected) toySelect.value = selected;
+      if (selected && Array.from(toySelect.options).some((opt) => opt.value === selected)) {
+        toySelect.value = selected;
+      }
       const withBattery = (toys || []).filter((toy) => toy.battery != null);
       batteryLine.textContent = withBattery.length
         ? withBattery.map((toy) => toy.name + "  " + toy.battery + "%").join(" | ")
         : "";
+      loadedToys = toys || [];
+      renderFunctions();
     }
+
+    function fnName(name) {
+      const labels = {
+        Vibrate: "Vibration",
+        Vibrate1: "Vibration 1",
+        Vibrate2: "Vibration 2",
+        Vibrate3: "Vibration 3",
+        Rotate: "Rotation",
+        Pump: "Pump",
+        Thrusting: "Thrusting",
+        Fingering: "Fingering",
+        Suction: "Suction",
+        Depth: "Depth",
+        Oscillate: "Oscillate",
+        Stroke: "Stroke range",
+        Position: "Position"
+      };
+      return labels[name] || name;
+    }
+
+    function selectedFunctions() {
+      const id = toySelect.value;
+      const chosen = id ? loadedToys.filter((toy) => String(toy.id) === String(id)) : loadedToys;
+      const names = [];
+      (chosen.length ? chosen : [{ functions: ["Vibrate"] }]).forEach((toy) => {
+        const list = (toy.functions && toy.functions.length) ? toy.functions : ["Vibrate"];
+        list.forEach((name) => {
+          if (names.indexOf(name) < 0) names.push(name);
+        });
+      });
+      return names.length ? names : ["Vibrate"];
+    }
+
+    function collectLevels() {
+      const levels = {};
+      if (selectedFunctions().indexOf("Vibrate") >= 0 && !strength.hidden) {
+        levels.Vibrate = parseInt(strength.value, 10) || 0;
+      }
+      document.querySelectorAll("#extraControls input").forEach((input) => {
+        levels[input.getAttribute("data-fn")] = parseInt(input.value, 10) || 0;
+      });
+      return levels;
+    }
+
+    function levelsOn(levels) {
+      return Object.keys(levels).some((name) => levels[name] > 0);
+    }
+
+    function multiOn(levels) {
+      return Object.keys(levels).some((name) => name !== "Vibrate" && levels[name] > 0);
+    }
+
+    function zeroExtras() {
+      document.querySelectorAll("#extraControls input").forEach((input) => {
+        input.value = "0";
+        const val = document.getElementById(input.id + "Val");
+        if (val) val.textContent = "0";
+      });
+    }
+
+    function showPatternTools(hasVibe) {
+      ["presetHeading", "presetNote", "presetButtons", "mineHeading", "mineNote", "savedPatterns"].forEach((id) => {
+        const el = document.getElementById(id);
+        if (el) el.hidden = !hasVibe;
+      });
+      const make = document.getElementById("makePattern");
+      if (guestToken) make.hidden = true;
+      else make.hidden = !hasVibe;
+      if (!hasVibe) document.getElementById("builder").hidden = true;
+    }
+
+    function runLabel(names) {
+      if (guestToken && pageMode === "hooker") return "Work it";
+      if (names.length === 1 && names[0] === "Vibrate") {
+        return guestToken ? "Vibrate" : "Vibrate for those seconds";
+      }
+      return guestToken ? "Run" : "Run for those seconds";
+    }
+
+    function renderFunctions() {
+      const names = selectedFunctions();
+      const key = (toySelect.value || "*") + "|" + names.join(",");
+      const hasVibe = names.indexOf("Vibrate") >= 0;
+      document.getElementById("strengthLabel").hidden = !hasVibe;
+      strength.hidden = !hasVibe;
+      showPatternTools(hasVibe);
+      document.getElementById("vibrate").textContent = runLabel(names);
+      const note = document.getElementById("toyFns");
+      if (!loadedToys.length) note.textContent = "";
+      else {
+        const chosen = toySelect.value
+          ? loadedToys.filter((toy) => String(toy.id) === String(toySelect.value))
+          : loadedToys;
+        const who = chosen.length === 1 ? (chosen[0].name || "This toy") : "These toys";
+        note.textContent = who + ": " + names.map(fnName).join(", ") + ".";
+      }
+      if (key === shownFns) return;
+      shownFns = key;
+      const box = document.getElementById("extraControls");
+      box.replaceChildren();
+      names.forEach((name) => {
+        if (name === "Vibrate") return;
+        const inputId = "fn-" + name;
+        const label = document.createElement("label");
+        label.htmlFor = inputId;
+        label.append(document.createTextNode(fnName(name) + " 0–100: "));
+        const val = document.createElement("span");
+        val.id = inputId + "Val";
+        val.textContent = "0";
+        label.append(val);
+        const input = document.createElement("input");
+        input.id = inputId;
+        input.type = "range";
+        input.min = "0";
+        input.max = "100";
+        input.step = "1";
+        input.value = "0";
+        input.setAttribute("data-fn", name);
+        input.oninput = () => {
+          val.textContent = input.value;
+          const levels = collectLevels();
+          if (levelsOn(levels)) beginSession();
+          else stopClock();
+          queueSend(false);
+        };
+        box.append(label, input);
+      });
+      if (guestToken && shownGrantLeft() <= 0) {
+        box.querySelectorAll("input").forEach((el) => { el.disabled = true; });
+      }
+    }
+
+    toySelect.onchange = () => {
+      shownFns = "";
+      strength.value = "0";
+      strengthVal.textContent = "0";
+      desired = 0;
+      renderFunctions();
+      queueSend(true);
+    };
 
     function parseLocalToys(data) {
       let payload = data && data.data && data.data.toys ? data.data.toys : (data && data.toys);
@@ -2055,16 +2429,23 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
       if (typeof payload === "string") {
         try { payload = JSON.parse(payload); } catch (e) { return []; }
       }
-      return Object.values(payload).map((toy) => {
+      return Object.values(payload).map((item) => {
+        let toy = item;
+        if (typeof toy === "string") {
+          try { toy = JSON.parse(toy); } catch (e) { return null; }
+        }
+        if (!toy || typeof toy !== "object") return null;
         const raw = toy.battery != null ? toy.battery : toy.batt;
         const n = parseInt(raw, 10);
         return {
           id: toy.id,
           name: toy.nickName || toy.name || toy.id,
           type: toy.name || "toy",
-          battery: Number.isNaN(n) ? null : Math.max(0, Math.min(100, n))
+          battery: Number.isNaN(n) ? null : Math.max(0, Math.min(100, n)),
+          fullFunctionNames: toy.fullFunctionNames,
+          shortFunctionNames: toy.shortFunctionNames
         };
-      }).filter((toy) => toy.battery != null);
+      }).filter((toy) => toy && toy.battery != null);
     }
 
     async function readBattery() {
@@ -2110,9 +2491,12 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
           status.textContent = (data.toys && data.toys.length)
             ? "Drag it. She stays on."
             : "No toy yet.";
-        } else {
+        }         else {
+          const names = selectedFunctions();
           status.textContent = (data.toys && data.toys.length)
-            ? "Move the slider. Power follows while you drag."
+            ? (names.length > 1
+              ? "Each slider is one of this toy's controls."
+              : "Move the slider. Power follows while you drag.")
             : "No toys reported yet. Keep Lovense Connect open and refresh.";
         }
       } catch (e) {
@@ -2125,6 +2509,7 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
         const name = button.getAttribute("data-pattern");
         const seconds = Math.max(2, allowedSeconds());
         stopClock();
+        zeroExtras();
         desired = 0;
         lastSent = 0;
         beginSession(true);
@@ -2149,21 +2534,37 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
     });
 
     document.getElementById("vibrate").onclick = () => {
-      const level = parseInt(strength.value, 10) || 0;
-      if (level === 0) {
-        status.textContent = "Move the slider above 0 first.";
+      const levels = collectLevels();
+      if (!levelsOn(levels)) {
+        status.textContent = "Move a slider above 0 first.";
         return;
       }
       stopClock();
-      desired = level;
+      desired = levels.Vibrate || 0;
+      beginSession(true);
+      if (multiOn(levels)) {
+        lastLevels = "";
+        wasMulti = true;
+        const seconds = allowedSeconds();
+        status.textContent = "Running for " + seconds + " seconds.";
+        postCommand(withActor({
+          levels: levels,
+          duration: seconds,
+          stop: false,
+          toy_id: toySelect.value || undefined
+        })).catch((e) => {
+          status.textContent = e.message || "Command failed.";
+        });
+        return;
+      }
       resend = true;
-      beginSession();
       queueSend(false);
     };
     document.getElementById("stop").onclick = () => {
       stopClock();
       strength.value = "0";
       strengthVal.textContent = "0";
+      zeroExtras();
       desired = 0;
       queueSend(true);
     };
@@ -2200,6 +2601,7 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
     async function playCustom(label, extra) {
       const seconds = Math.max(2, allowedSeconds());
       stopClock();
+      zeroExtras();
       desired = 0;
       lastSent = 0;
       beginSession(true);
@@ -2350,6 +2752,7 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
       stopClock();
       strength.value = "0";
       strengthVal.textContent = "0";
+      zeroExtras();
       desired = 0;
       lastSent = 0;
       try {
@@ -2467,6 +2870,7 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
             .then((r) => r.json())
             .then((data) => {
               if (data && data.seconds_left != null) applyGrant(data);
+              if (data && data.toys) showToys(data.toys);
               if (data && data.rate) {
                 addTime.hidden = false;
                 addTime.textContent = "Pay her collar to add time. L$" + data.rate + " a minute.";
@@ -2535,7 +2939,7 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
         .then((r) => r.json())
         .then((data) => { if (data && data.toys) showToys(data.toys); })
         .catch(() => {});
-    }, 20000);
+    }, 5000);
   </script>
 </body>
 </html>`);
@@ -2758,7 +3162,15 @@ app.post('/api/hud/battery', async (req, res) => {
     const incoming = reported.map((toy) => ({
       id: toy.id,
       name: toy.name || toy.nickName,
-      battery: toyBattery(toy)
+      type: toy.type,
+      battery: toyBattery(toy),
+      functions: (toy.fullFunctionNames || toy.shortFunctionNames || toy.functions)
+        ? functionsForToy({
+          fullFunctionNames: toy.fullFunctionNames || toy.functions,
+          shortFunctionNames: toy.shortFunctionNames,
+          toyType: toy.type || toy.name
+        })
+        : undefined
     })).filter((toy) => toy.battery != null);
     if (!incoming.length) {
       return res.json({ success: false });
@@ -3004,6 +3416,83 @@ app.post('/api/hud/vibrate', async (req, res) => {
     const session = await getSession(wearer_uuid);
     if (!session || session.status !== 'connected') {
       return res.status(404).json({ error: "Toy is not connected or session expired. Re-link the QR." });
+    }
+
+    const levelMap = req.body.levels;
+    if (levelMap && typeof levelMap === 'object' && !Array.isArray(levelMap)) {
+      let seconds = parseInt(duration, 10);
+      if (Number.isNaN(seconds)) seconds = 0;
+      const vibeCap = actor.guest ? Math.max(1, actor.secondsLeft || 60) : 60;
+      seconds = Math.max(0, Math.min(vibeCap, seconds));
+      const built = levelsToCommand(levelMap);
+      const stopNow = stop === true || stop === 'true' || (!built.action && !built.position);
+      if (actor.guest && !stopNow) {
+        const limited = limitSeconds(Math.max(1, seconds), actor);
+        if (limited.error) return res.status(limited.status).json({ error: limited.error });
+        seconds = limited.seconds;
+      }
+      cancelFade(wearer_uuid);
+      let commandData;
+      if (stopNow) {
+        commandData = await sendToyCommand(wearer_uuid, session.connection, {
+          command: 'Function',
+          action: 'Stop',
+          timeSec: 0,
+          apiVer: 1,
+          stopPrevious: 1
+        });
+      } else {
+        if (built.action) {
+          const command = {
+            command: 'Function',
+            action: built.action,
+            timeSec: Math.max(1, seconds),
+            apiVer: 1,
+            stopPrevious: 1
+          };
+          if (toy_id) command.toy = toy_id;
+          commandData = await sendToyCommand(wearer_uuid, session.connection, command);
+        }
+        if (built.position && (!commandData || commandOk(commandData))) {
+          const position = {
+            command: 'Position',
+            value: String(built.position),
+            apiVer: 1
+          };
+          if (toy_id) position.toy = toy_id;
+          const moved = await sendToyCommand(wearer_uuid, session.connection, position);
+          if (!commandData || !commandOk(moved)) commandData = moved;
+        }
+      }
+      if (!commandOk(commandData)) {
+        const offline = commandData && (commandData.code === 507 || /offline/i.test(String(commandData.message || '')));
+        return res.status(502).json({
+          error: offline
+            ? "Lovense Remote is asleep. Open Remote, keep the phone screen on, then try again."
+            : (commandData.message || "Lovense rejected the command."),
+          details: commandData
+        });
+      }
+      const strengthNow = stopNow ? 0 : Math.max(
+        scaledLevel('Vibrate', levelMap.Vibrate || 0),
+        scaledLevel('Rotate', levelMap.Rotate || 0),
+        scaledLevel('Thrusting', levelMap.Thrusting || 0),
+        1
+      );
+      await db.query(
+        `UPDATE active_sessions
+         SET vibe_strength = $2,
+             vibe_until = CASE
+               WHEN $2 <= 0 THEN NOW()
+               ELSE NOW() + ($3 * INTERVAL '1 second')
+             END
+         WHERE sl_uuid = $1`,
+        [wearer_uuid, strengthNow, stopNow ? 0 : Math.max(1, seconds)]
+      );
+      let clock = {};
+      if (actor.guest && stopNow) clock = await stopGuestClock(actor, wearer_uuid);
+      else if (actor.guest) clock = await startGuestClock(actor, wearer_uuid) || {};
+      return res.json({ success: true, details: commandData, seconds_left: clock.seconds_left, running: clock.running });
     }
 
     let percent = parseInt(strength, 10);
