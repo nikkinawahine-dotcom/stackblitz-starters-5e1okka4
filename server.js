@@ -696,24 +696,16 @@ function clampLevel(value) {
 function buildGlide(from, to) {
   const start = clampLevel(from);
   const end = clampLevel(to);
-  if (start === end) return Array(50).fill(start);
+  if (start === end) return Array(20).fill(start);
   const sign = Math.sign(end - start);
-  const minDwell = 10;
+  const dwell = 3;
   const levels = [start];
   let level = start;
-  while (level !== end && (levels.length + 1) * minDwell <= 50) {
+  while (level !== end && levels.length < 7) {
     level += sign;
     levels.push(level);
   }
-  const base = Math.floor(50 / levels.length);
-  const dwell = Math.min(16, Math.max(minDwell, base));
   const counts = levels.map(() => dwell);
-  let extra = Math.min(50 - counts.reduce((sum, n) => sum + n, 0), levels.length);
-  for (let i = levels.length - 1; extra > 0; i -= 1) {
-    counts[i] += 1;
-    extra -= 1;
-    if (i === 0) i = levels.length;
-  }
   const steps = [];
   for (let i = 0; i < levels.length; i++) {
     for (let n = 0; n < counts[i] && steps.length < 50; n++) steps.push(levels[i]);
@@ -730,12 +722,15 @@ function playingLevel(state) {
 
 function glideCovers(state, target) {
   if (!state || !state.steps || !state.playStarted) return false;
-  if (state.playUntil - Date.now() <= 200) return false;
+  if (state.playUntil - Date.now() <= 300) return false;
   const now = playingLevel(state);
   const end = state.steps[state.steps.length - 1];
   const goal = clampLevel(target);
-  if (state.flat) return now === goal && end === goal;
-  return true;
+  if (state.flat) return now === goal;
+  const traveling = Math.sign(end - now);
+  const wanted = Math.sign(goal - now);
+  if (wanted === 0 || traveling === 0 || traveling === wanted) return true;
+  return Date.now() - state.playStarted < 400;
 }
 
 const followers = new Map();
@@ -815,7 +810,7 @@ async function planLevel(uid) {
     return;
   }
   if (glideCovers(state, target)) {
-    schedulePlan(uid, Math.max(250, Math.min(700, state.playUntil - Date.now() - 200)));
+    schedulePlan(uid, Math.max(200, Math.min(500, state.playUntil - Date.now() - 300)));
     return;
   }
 
@@ -871,7 +866,7 @@ async function planLevel(uid) {
     state.sentAt = started;
     state.playStarted = started;
     state.playUntil = started + timeSec * 1000;
-    state.nextSendAt = started + MIN_GAP_MS;
+    state.nextSendAt = Math.min(started + 400, state.playUntil - 300);
   } catch (err) {
     console.error('Slider pattern failed:', err.message);
     state.lastResult = { code: 500, message: err.message };
@@ -882,7 +877,7 @@ async function planLevel(uid) {
       current.busy = false;
       if (Date.now() < current.until || clampLevel(current.target) === 0) {
         const wait = glideCovers(current, current.target)
-          ? Math.max(250, Math.min(700, current.playUntil - Date.now() - 200))
+          ? Math.max(200, Math.min(500, current.playUntil - Date.now() - 300))
           : Math.max(0, current.nextSendAt - Date.now());
         schedulePlan(uid, wait);
       }
@@ -1241,7 +1236,7 @@ app.get('/control/:sl_uuid', (req, res) => {
 </head>
 <body>
   <h1>Toy controls</h1>
-  <p>Drag the slider from 0 to 100, then pause. The motor takes a few seconds to ease there, one tiny step at a time.</p>
+  <p>Move the slider. Power follows while you drag, and the motor keeps running through the change.</p>
   <label for="toy">Toy</label>
   <select id="toy"><option value="">All connected toys</option></select>
   <label for="strength">Vibration 0–100: <span id="strengthVal">0</span></label>
@@ -1301,23 +1296,25 @@ app.get('/control/:sl_uuid', (req, res) => {
         status.textContent = "Stopped.";
         return;
       }
-      if (sendTimer) clearTimeout(sendTimer);
+      if (sendTimer) return;
       sendTimer = setTimeout(() => {
         sendTimer = null;
         const level = desired;
         const step = toyStep(level);
         const left = level === 0 ? 0 : remaining();
         if (level > 0 && left <= 0) return;
-        if (step === lastSent) return;
-        lastSent = step;
-        postCommand(commandBody(level, left, false)).catch((e) => {
-          lastSent = -1;
-          status.textContent = e.message || "Command failed.";
-        });
-        status.textContent = level === 0
-          ? "Easing off."
-          : ("Strength " + level + " of 100");
-      }, 700);
+        if (step !== lastSent) {
+          lastSent = step;
+          postCommand(commandBody(level, left, false)).catch((e) => {
+            lastSent = -1;
+            status.textContent = e.message || "Command failed.";
+          });
+          status.textContent = level === 0
+            ? "Easing off."
+            : ("Strength " + level + " of 100");
+        }
+        if (toyStep(desired) !== lastSent) queueSend(false);
+      }, lastSent < 0 ? 0 : 150);
     }
 
     strength.oninput = () => {
@@ -1449,7 +1446,7 @@ app.get('/control/:sl_uuid', (req, res) => {
         localCommand = data.local_command || "";
         showToys(data.toys);
         status.textContent = (data.toys && data.toys.length)
-          ? "Drag the slider, then pause. It eases there over a few seconds."
+          ? "Move the slider. Power follows while you drag."
           : "No toys reported yet. Keep Lovense Connect open and refresh.";
       } catch (e) {
         status.textContent = "Failed to load toys.";
