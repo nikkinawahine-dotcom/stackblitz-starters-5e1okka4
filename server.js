@@ -111,6 +111,7 @@ async function ensureSchema() {
   await db.query(`ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS shared BOOLEAN DEFAULT false`);
   await db.query(`ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS vibe_strength INTEGER DEFAULT 0`);
   await db.query(`ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS vibe_until TIMESTAMPTZ`);
+  await db.query(`ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS hud_mode TEXT DEFAULT 'normal'`);
   await db.query(`CREATE TABLE IF NOT EXISTS saved_patterns (
     id BIGSERIAL PRIMARY KEY,
     sl_uuid TEXT NOT NULL,
@@ -130,7 +131,19 @@ async function ensureSchema() {
   )`);
   await db.query(`ALTER TABLE control_grants ADD COLUMN IF NOT EXISTS sender_name TEXT`);
   await db.query(`ALTER TABLE control_grants ADD COLUMN IF NOT EXISTS seconds_left INTEGER`);
+  await db.query(`ALTER TABLE control_grants ADD COLUMN IF NOT EXISTS hud_mode TEXT DEFAULT 'normal'`);
   await db.query(`ALTER TABLE control_grants ADD COLUMN IF NOT EXISTS running_since TIMESTAMPTZ`);
+  await db.query(`CREATE TABLE IF NOT EXISTS control_offers (
+    id TEXT PRIMARY KEY,
+    wearer_uuid TEXT NOT NULL,
+    recipient_uuid TEXT NOT NULL,
+    recipient_name TEXT,
+    sender_name TEXT,
+    seconds INTEGER NOT NULL,
+    price INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
   await db.query(`UPDATE control_grants
     SET seconds_left = GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (expires_at - NOW())))::int)
     WHERE seconds_left IS NULL`);
@@ -1098,7 +1111,7 @@ async function resolveControl(body) {
   if (token) {
     if (!token || token.length > 80) return { error: "This control link is not valid.", status: 404 };
     const result = await db.query(
-      `SELECT wearer_uuid, expires_at, sender_name, seconds_left, running_since FROM control_grants WHERE token = $1`,
+      `SELECT wearer_uuid, expires_at, sender_name, seconds_left, running_since, hud_mode FROM control_grants WHERE token = $1`,
       [token]
     );
     if (!result.rows.length) return { error: "This control link is not valid.", status: 404 };
@@ -1120,12 +1133,34 @@ async function resolveControl(body) {
       senderName: row.sender_name || '',
       token,
       secondsLeft,
-      running: !!row.running_since
+      running: !!row.running_since,
+      hudMode: hudMode(row.hud_mode)
     };
   }
   const wearer = String((body && (body.wearer_uuid || body.sl_uuid)) || '');
   if (!wearer || wearer.length > 80) return { error: "Missing wearer_uuid.", status: 400 };
   return { wearer, guest: false, expiresAt: null };
+}
+
+function hudMode(raw) {
+  return String(raw || '').toLowerCase() === 'hooker' ? 'hooker' : 'normal';
+}
+
+const LINDENS_PER_MINUTE = 30;
+
+function offerPrice(seconds) {
+  return Math.max(1, Math.round((seconds / 60) * LINDENS_PER_MINUTE));
+}
+
+function offerLabel(seconds) {
+  if (seconds % 60 === 0) {
+    const minutes = seconds / 60;
+    return minutes === 1 ? '1 minute' : minutes + ' minutes';
+  }
+  if (seconds < 60) return seconds === 1 ? '1 second' : seconds + ' seconds';
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return minutes + (minutes === 1 ? ' minute ' : ' minutes ') + rest + (rest === 1 ? ' second' : ' seconds');
 }
 
 function limitSeconds(seconds, actor) {
@@ -1138,7 +1173,7 @@ function limitSeconds(seconds, actor) {
 
 async function getSession(slUuid) {
   const result = await db.query(
-    `SELECT sl_uuid, sl_http_url, status, toys, display_name, shared, vibe_strength, vibe_until
+    `SELECT sl_uuid, sl_http_url, status, toys, display_name, shared, vibe_strength, vibe_until, hud_mode
      FROM active_sessions WHERE sl_uuid = $1`,
     [slUuid]
   );
@@ -1351,7 +1386,8 @@ app.get('/api/hud/status/:sl_uuid', async (req, res) => {
       connected,
       vibe,
       toys,
-      toy_line: connected ? toyLine(toys) : 'No toy'
+      toy_line: connected ? toyLine(toys) : 'No toy',
+      hud_mode: hudMode(session.hud_mode)
     });
   } catch (err) {
     console.error(err);
@@ -1397,6 +1433,23 @@ app.post('/api/hud/share', async (req, res) => {
   }
 });
 
+app.post('/api/hud/mode', async (req, res) => {
+  const wearer = String(req.body.sl_uuid || req.body.wearer_uuid || '');
+  const mode = hudMode(req.body.mode);
+  if (!wearer) return res.status(400).json({ error: "Missing wearer." });
+  try {
+    const updated = await db.query(
+      `UPDATE active_sessions SET hud_mode = $2 WHERE sl_uuid = $1 RETURNING hud_mode`,
+      [wearer, mode]
+    );
+    if (!updated.rows.length) return res.status(404).json({ error: "Link your toy first." });
+    return res.json({ success: true, hud_mode: mode });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not switch the HUD." });
+  }
+});
+
 app.post('/api/hud/grant', async (req, res) => {
   const wearer = String(req.body.sl_uuid || '');
   const recipient = String(req.body.recipient_uuid || '');
@@ -1413,11 +1466,12 @@ app.post('/api/hud/grant', async (req, res) => {
       return res.status(404).json({ error: "Link your toy before sending a control link." });
     }
     const senderName = sentName || String(session.display_name || '').trim();
+    const mode = hudMode(req.body.mode || session.hud_mode);
     const token = crypto.randomBytes(18).toString('hex');
     await db.query(
-      `INSERT INTO control_grants (token, wearer_uuid, recipient_uuid, recipient_name, sender_name, seconds_left, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6, NOW() + ($7 * INTERVAL '1 minute'))`,
-      [token, wearer, recipient, recipientName, senderName || null, minutes * 60, minutes]
+      `INSERT INTO control_grants (token, wearer_uuid, recipient_uuid, recipient_name, sender_name, seconds_left, hud_mode, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() + ($8 * INTERVAL '1 minute'))`,
+      [token, wearer, recipient, recipientName, senderName || null, minutes * 60, mode, minutes]
     );
     if (senderName) {
       await db.query(
@@ -1433,6 +1487,158 @@ app.post('/api/hud/grant', async (req, res) => {
   } catch (err) {
     console.error("Grant error:", err);
     res.status(500).json({ error: "Could not create the control link." });
+  }
+});
+
+app.post('/api/hud/offer', async (req, res) => {
+  const wearer = String(req.body.sl_uuid || '');
+  const recipient = String(req.body.recipient_uuid || '');
+  const recipientName = String(req.body.recipient_name || 'someone').replace(/[\r\n\t]/g, ' ').trim().slice(0, 64) || 'someone';
+  const sentName = String(req.body.sender_name || '').replace(/[\r\n\t]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 64);
+  let seconds = parseInt(req.body.seconds, 10);
+  if (!wearer || !recipient) return res.status(400).json({ error: "Missing avatar." });
+  if (recipient === wearer) return res.status(400).json({ error: "Pick someone else." });
+  if (!seconds || seconds < 1 || seconds > 3600) {
+    return res.status(400).json({ error: "Offer from 1 second up to 60 minutes." });
+  }
+
+  try {
+    const session = await getSession(wearer);
+    if (!session || session.status !== 'connected') {
+      return res.status(404).json({ error: "Link your toy before sending an offer." });
+    }
+    if (hudMode(session.hud_mode) !== 'hooker') {
+      return res.status(400).json({ error: "Switch to hooker mode before sending an offer." });
+    }
+    const senderName = sentName || String(session.display_name || '').trim() || 'Someone';
+    const price = offerPrice(seconds);
+    const label = offerLabel(seconds);
+    const id = crypto.randomBytes(18).toString('hex');
+    await db.query(`UPDATE control_offers SET status = 'cancelled' WHERE wearer_uuid = $1 AND status = 'pending'`, [wearer]);
+    await db.query(
+      `INSERT INTO control_offers (id, wearer_uuid, recipient_uuid, recipient_name, sender_name, seconds, price)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [id, wearer, recipient, recipientName, senderName, seconds, price]
+    );
+    return res.json({
+      success: true,
+      offer_id: id,
+      price,
+      seconds,
+      label,
+      offer_url: `${publicBase(req)}/offer/${id}`
+    });
+  } catch (err) {
+    console.error("Offer error:", err);
+    res.status(500).json({ error: "Could not send the offer." });
+  }
+});
+
+app.post('/api/hud/offer/accept', async (req, res) => {
+  const wearer = String(req.body.sl_uuid || '');
+  const offerId = String(req.body.offer_id || '');
+  const recipient = String(req.body.recipient_uuid || '');
+  const amount = parseInt(req.body.amount, 10);
+  if (!wearer || !offerId || !recipient) return res.status(400).json({ error: "Missing offer." });
+
+  try {
+    const found = await db.query(
+      `SELECT * FROM control_offers
+       WHERE id = $1 AND wearer_uuid = $2 AND status = 'pending'
+         AND created_at > NOW() - INTERVAL '15 minutes'`,
+      [offerId, wearer]
+    );
+    if (!found.rows.length) return res.status(404).json({ error: "That offer is no longer open." });
+    const offer = found.rows[0];
+    if (offer.recipient_uuid !== recipient) return res.status(403).json({ error: "This offer is for someone else." });
+    if (amount !== Number(offer.price)) return res.status(400).json({ error: "The payment does not match the price." });
+
+    const session = await getSession(wearer);
+    if (!session || session.status !== 'connected') {
+      return res.status(404).json({ error: "The toy is not connected." });
+    }
+
+    const token = crypto.randomBytes(18).toString('hex');
+    await db.query(
+      `INSERT INTO control_grants (token, wearer_uuid, recipient_uuid, recipient_name, sender_name, seconds_left, hud_mode, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, 'hooker', NOW() + ($6 * INTERVAL '1 second'))`,
+      [token, wearer, recipient, offer.recipient_name, offer.sender_name, offer.seconds]
+    );
+    await db.query(`UPDATE control_offers SET status = 'paid' WHERE id = $1`, [offerId]);
+    return res.json({
+      success: true,
+      price: offer.price,
+      label: offerLabel(offer.seconds),
+      control_url: `${publicBase(req)}/guest/${token}`
+    });
+  } catch (err) {
+    console.error("Offer accept error:", err);
+    res.status(500).json({ error: "Could not start the paid time." });
+  }
+});
+
+app.post('/api/hud/offer/decline', async (req, res) => {
+  const wearer = String(req.body.sl_uuid || '');
+  const offerId = String(req.body.offer_id || '');
+  const recipient = String(req.body.recipient_uuid || '');
+  if (!wearer || !offerId || !recipient) return res.status(400).json({ error: "Missing offer." });
+  try {
+    await db.query(
+      `UPDATE control_offers SET status = 'declined'
+       WHERE id = $1 AND wearer_uuid = $2 AND recipient_uuid = $3 AND status = 'pending'`,
+      [offerId, wearer, recipient]
+    );
+    return res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not close the offer." });
+  }
+});
+
+app.get('/offer/:id', async (req, res) => {
+  try {
+    const found = await db.query(
+      `SELECT sender_name, seconds, price, status, created_at
+       FROM control_offers WHERE id = $1`,
+      [String(req.params.id || '')]
+    );
+    if (!found.rows.length) {
+      return res.status(404).type('html').send(guestMessage("This offer is not open."));
+    }
+    const offer = found.rows[0];
+    const fresh = offer.status === 'pending' && (Date.now() - new Date(offer.created_at).getTime()) < 15 * 60 * 1000;
+    const name = String(offer.sender_name || 'She').replace(/[&<>"]/g, '');
+    const label = offerLabel(offer.seconds);
+    const note = fresh
+      ? `Pay her collar L$${offer.price}. That pays her for this time.`
+      : "This offer is closed.";
+    res.type('html').send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${name} — Hot Hawaiian Nights</title>
+  <link href="https://fonts.googleapis.com/css2?family=Pacifico&display=swap" rel="stylesheet">
+  <style>
+    body { font-family: sans-serif; background: #160208; color: #ffe8ee; max-width: 420px; margin: 0 auto; padding: 24px; }
+    h1 { margin: 0 0 8px; font-family: "Pacifico", cursive; font-size: 30px; font-weight: 400; background: linear-gradient(100deg, #ffe08a, #ff8a1e 40%, #ff3d6e 75%, #ff4df0); -webkit-background-clip: text; background-clip: text; color: transparent; }
+    .name { margin: 0; color: #ff5a7a; font-size: 22px; font-weight: bold; letter-spacing: 0.04em; text-transform: uppercase; }
+    .price { font-size: 28px; font-weight: bold; color: #ffe08a; margin: 12px 0; }
+    p { color: #ffc1cf; }
+  </style>
+</head>
+<body>
+  <h1>HOT HAWAIIAN NIGHTS</h1>
+  <p class="name">${name}</p>
+  <p>${name} is offering ${label}.</p>
+  <p class="price">L$${offer.price}</p>
+  <p>L$${LINDENS_PER_MINUTE} a minute.</p>
+  <p>${note}</p>
+</body>
+</html>`);
+  } catch (err) {
+    console.error(err);
+    res.status(500).type('html').send(guestMessage("Could not open this offer."));
   }
 });
 
@@ -1519,7 +1725,7 @@ app.get('/api/hud/toys/:sl_uuid', async (req, res) => {
   }
 });
 
-function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSeconds, grantRunning) {
+function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSeconds, grantRunning, pageMode) {
   res.type('html').send(`<!DOCTYPE html>
 <html>
 <head>
@@ -1564,26 +1770,34 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
     .saved-row .remove { width: auto; background: #444; padding: 7px 10px; }
     #status { min-height: 24px; color: #9f9; }
     .sender { margin: 2px 0 0; font-size: 22px; font-weight: bold; color: #ffe08a; }
+    body.hooker { background: #160208; color: #ffe8ee; }
+    body.hooker button { background: #c8102e; }
+    body.hooker button.secondary { background: #3a1018; }
+    body.hooker .patterns button { background: #6b1024; }
+    body.hooker .sender { color: #ff5a7a; letter-spacing: 0.04em; text-transform: uppercase; }
+    body.hooker #grantLine, body.hooker .pattern-note { color: #ffc1cf; }
+    body.hooker #status { color: #ffd0dc; }
     [hidden] { display: none !important; }
   </style>
 </head>
-<body>
+<body class="${guestToken && pageMode === 'hooker' ? 'hooker' : ''}">
   <header class="brand">
     <img src="/logo.png" alt="Hot Hawaiian Nights">
     <h1>HOT HAWAIIAN NIGHTS</h1>
   </header>
   <p id="senderName" class="sender"${ownerName ? "" : " hidden"}></p>
   <p id="intro">Move the slider. The motor stays on and the strength eases while you drag.</p>
+  <button type="button" id="hudMode" class="secondary">Normal HUD</button>
   <p id="grantLine" class="pattern-note"></p>
-  <label for="toy">Toy</label>
+  <label id="toyLabel" for="toy">Toy</label>
   <select id="toy"><option value="">All connected toys</option></select>
-  <label for="strength">Vibration 0–100: <span id="strengthVal">0</span></label>
+  <label id="strengthLabel" for="strength">Vibration 0–100: <span id="strengthVal">0</span></label>
   <input id="strength" type="range" min="0" max="100" step="1" value="0">
-  <label for="duration">Seconds</label>
+  <label id="secondsLabel" for="duration">Seconds</label>
   <input id="duration" type="number" min="1" max="60" value="5">
   <button id="vibrate">Vibrate for those seconds</button>
-  <h2>Vibration patterns</h2>
-  <p class="pattern-note">Lovense patterns for Connect and Remote. They run for the seconds above.</p>
+  <h2 id="presetHeading">Vibration patterns</h2>
+  <p id="presetNote" class="pattern-note">Lovense patterns for Connect and Remote. They run for the seconds above.</p>
   <div class="patterns">
     <button type="button" data-pattern="pulse">Pulse</button>
     <button type="button" data-pattern="wave">Wave</button>
@@ -1614,6 +1828,8 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
     let grantLeft = ${Number(grantSeconds) || 0};
     let grantRunning = ${grantRunning ? "true" : "false"};
     let grantSync = Date.now();
+    const pageMode = ${JSON.stringify(pageMode || "normal")};
+    let sentMode = "normal";
 
     function withActor(body) {
       if (guestToken) body.grant_token = guestToken;
@@ -1643,6 +1859,7 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
     }
 
     function allowedSeconds() {
+      if (guestToken) return Math.max(2, shownGrantLeft() || grantLeft || 2);
       const n = parseInt(duration.value, 10) || 5;
       return Math.max(1, Math.min(60, n));
     }
@@ -1821,9 +2038,15 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
         localCommand = data.local_command || "";
         showToys(data.toys);
         if (guestToken) renderGuestPatterns(data.patterns || []);
-        status.textContent = (data.toys && data.toys.length)
-          ? "Move the slider. Power follows while you drag."
-          : "No toys reported yet. Keep Lovense Connect open and refresh.";
+        if (guestToken && pageMode === "hooker") {
+          status.textContent = (data.toys && data.toys.length)
+            ? "Drag it. She stays on."
+            : "No toy yet.";
+        } else {
+          status.textContent = (data.toys && data.toys.length)
+            ? "Move the slider. Power follows while you drag."
+            : "No toys reported yet. Keep Lovense Connect open and refresh.";
+        }
       } catch (e) {
         status.textContent = "Failed to load toys.";
       }
@@ -2116,9 +2339,13 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
         document.querySelectorAll("button, input, select").forEach((el) => { el.disabled = true; });
         return;
       }
-      line.textContent = grantRunning
-        ? ("Controlling " + (ownerName || "their") + "'s toy. Time left " + clockText + ".")
-        : ("Time left " + clockText + ". Paused. Start again to use the rest.");
+      line.textContent = pageMode === "hooker"
+        ? (grantRunning
+          ? ("On the clock. " + clockText + " left.")
+          : ("Clock paused. " + clockText + " left. Start again."))
+        : (grantRunning
+          ? ("Controlling " + (ownerName || "their") + "'s toy. Time left " + clockText + ".")
+          : ("Time left " + clockText + ". Paused. Start again to use the rest."));
     }
 
     function tickGrant() {
@@ -2127,16 +2354,66 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
 
     if (guestToken) {
       showSender(ownerName);
+      document.getElementById("hudMode").hidden = true;
       document.getElementById("intro").textContent = ownerName
         ? ("You are controlling " + ownerName + "'s toy. Time runs only while the toy is on.")
         : "Time runs only while the toy is on. Stop keeps the rest.";
       document.getElementById("mineHeading").textContent = ownerName ? (ownerName + "'s patterns") : "Their patterns";
-      document.getElementById("mineNote").textContent = "Patterns this avatar saved. They run for the seconds above.";
+      document.getElementById("mineNote").textContent = "Patterns this avatar saved.";
+      document.getElementById("presetNote").textContent = "Lovense patterns for Connect and Remote.";
+      document.getElementById("secondsLabel").hidden = true;
+      document.getElementById("duration").hidden = true;
+      document.getElementById("vibrate").textContent = "Vibrate";
       document.getElementById("disconnect").hidden = true;
       document.getElementById("makePattern").hidden = true;
       document.getElementById("builder").hidden = true;
+      if (pageMode === "hooker") {
+        document.getElementById("intro").textContent = ownerName
+          ? (ownerName + " is on the clock.")
+          : "On the clock.";
+        document.getElementById("toyLabel").textContent = "Her toy";
+        document.getElementById("strengthLabel").firstChild.textContent = "How hard 0–100: ";
+        document.getElementById("vibrate").textContent = "Work it";
+        document.getElementById("presetHeading").textContent = "Menu";
+        document.getElementById("presetNote").textContent = "Pick one. It runs while the clock is going.";
+        document.querySelector('[data-pattern="pulse"]').textContent = "Tease";
+        document.querySelector('[data-pattern="wave"]').textContent = "Ride";
+        document.querySelector('[data-pattern="fireworks"]').textContent = "Pop off";
+        document.querySelector('[data-pattern="earthquake"]').textContent = "Pound";
+        document.getElementById("mineHeading").textContent = ownerName ? (ownerName + "'s specials") : "Specials";
+        document.getElementById("mineNote").textContent = "What she saved.";
+        document.getElementById("stop").textContent = "Hold up";
+      }
       tickGrant();
       setInterval(tickGrant, 1000);
+    } else {
+      const modeButton = document.getElementById("hudMode");
+      modeButton.onclick = async () => {
+        const next = sentMode === "hooker" ? "normal" : "hooker";
+        try {
+          const r = await fetch("/api/hud/mode", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ wearer_uuid: uuid, mode: next })
+          });
+          const data = await r.json();
+          if (!r.ok || data.error) throw new Error(data.error || "Could not switch.");
+          sentMode = data.hud_mode || next;
+          modeButton.textContent = sentMode === "hooker" ? "Hooker HUD" : "Normal HUD";
+          status.textContent = sentMode === "hooker"
+            ? "Links now send the hooker HUD."
+            : "Links now send the normal HUD.";
+        } catch (e) {
+          status.textContent = e.message || "Could not switch.";
+        }
+      };
+      fetch("/api/hud/status/" + encodeURIComponent(uuid))
+        .then((r) => r.json())
+        .then((data) => {
+          sentMode = data && data.hud_mode === "hooker" ? "hooker" : "normal";
+          modeButton.textContent = sentMode === "hooker" ? "Hooker HUD" : "Normal HUD";
+        })
+        .catch(() => {});
     }
     loadToys().then(() => { if (!guestToken) readBattery(); });
     if (!guestToken) loadSaved();
@@ -2182,7 +2459,7 @@ app.get('/guest/:token', async (req, res) => {
     if (actor.error) return res.status(actor.status).type('html').send(guestMessage(actor.error));
     const session = await getSession(actor.wearer);
     const senderName = actor.senderName || (session && session.display_name) || "";
-    sendControlPage(res, "", req.params.token, 0, senderName, actor.secondsLeft, actor.running);
+    sendControlPage(res, "", req.params.token, 0, senderName, actor.secondsLeft, actor.running, actor.hudMode);
   } catch (err) {
     console.error(err);
     res.status(500).type('html').send(guestMessage("Could not open this control link."));
@@ -2510,7 +2787,8 @@ app.post('/api/hud/custom-pattern', async (req, res) => {
 
     let seconds = parseInt(req.body.duration, 10);
     if (Number.isNaN(seconds)) seconds = 5;
-    seconds = Math.max(2, Math.min(60, seconds));
+    const customCap = actor.guest ? Math.max(2, actor.secondsLeft || 60) : 60;
+    seconds = Math.max(2, Math.min(customCap, seconds));
     const limitedCustom = limitSeconds(seconds, actor);
     if (limitedCustom.error) return res.status(limitedCustom.status).json({ error: limitedCustom.error });
     seconds = limitedCustom.seconds;
@@ -2569,7 +2847,8 @@ app.post('/api/hud/pattern', async (req, res) => {
 
     let seconds = parseInt(req.body.duration, 10);
     if (Number.isNaN(seconds)) seconds = 5;
-    seconds = Math.max(2, Math.min(60, seconds));
+    const presetCap = actor.guest ? Math.max(2, actor.secondsLeft || 60) : 60;
+    seconds = Math.max(2, Math.min(presetCap, seconds));
     const limitedPreset = limitSeconds(seconds, actor);
     if (limitedPreset.error) return res.status(limitedPreset.status).json({ error: limitedPreset.error });
     seconds = limitedPreset.seconds;
@@ -2637,7 +2916,8 @@ app.post('/api/hud/vibrate', async (req, res) => {
     const level = percentToLevel(percent);
     let seconds = parseInt(duration, 10);
     if (Number.isNaN(seconds)) seconds = 0;
-    seconds = Math.max(0, Math.min(60, seconds));
+    const vibeCap = actor.guest ? Math.max(1, actor.secondsLeft || 60) : 60;
+    seconds = Math.max(0, Math.min(vibeCap, seconds));
     const stopNow = stop === true || stop === 'true';
     const stopping = stopNow || level === 0;
     if (actor.guest && !stopping) {
