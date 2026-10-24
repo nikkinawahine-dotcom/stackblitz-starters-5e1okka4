@@ -181,6 +181,37 @@ app.get('/neon-sign.png', async (req, res, next) => {
   }
 });
 
+app.get('/neon-sign.mp4', async (req, res, next) => {
+  try {
+    const found = await db.query(`SELECT bytes FROM site_assets WHERE name = 'neon-loop'`);
+    if (!found.rows[0]) return next();
+    const buf = found.rows[0].bytes;
+    const total = buf.length;
+    res.set('Content-Type', 'video/mp4');
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.set('Accept-Ranges', 'bytes');
+    const range = req.headers.range;
+    if (range) {
+      const match = /bytes=(\d+)-(\d*)/.exec(range);
+      const start = match ? Number(match[1]) : NaN;
+      const end = match && match[2] ? Number(match[2]) : total - 1;
+      if (!match || start >= total || end >= total || start > end) {
+        res.status(416).set('Content-Range', `bytes */${total}`).end();
+        return;
+      }
+      res.status(206);
+      res.set('Content-Range', `bytes ${start}-${end}/${total}`);
+      res.set('Content-Length', String(end - start + 1));
+      res.end(buf.subarray(start, end + 1));
+      return;
+    }
+    res.set('Content-Length', String(total));
+    res.end(buf);
+  } catch (err) {
+    next(err);
+  }
+});
+
 const LOVENSE_TOKEN = process.env.LOVENSE_DEVELOPER_TOKEN;
 const PLATFORM_NAME = process.env.LOVENSE_PLATFORM_NAME || 'HotHawaiianNights';
 
@@ -1754,6 +1785,39 @@ app.post('/api/hud/grant', async (req, res) => {
   }
 });
 
+app.post('/api/hud/visit-link', async (req, res) => {
+  const wearer = String(req.body.sl_uuid || '');
+  const recipient = String(req.body.recipient_uuid || '');
+  const recipientName = String(req.body.recipient_name || 'someone').replace(/[\r\n\t]/g, ' ').trim().slice(0, 64) || 'someone';
+  const sentName = String(req.body.sender_name || '').replace(/[\r\n\t]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 64);
+  const minutes = parseInt(req.body.minutes, 10);
+  const rate = Math.min(10000, Math.max(1, parseInt(req.body.per_minute, 10) || 0));
+  if (!wearer || !recipient) return res.status(400).json({ error: "Missing avatar." });
+  if (recipient === wearer) return res.status(400).json({ error: "Pick someone else." });
+  if (!minutes || minutes < 1 || minutes > 60) return res.status(400).json({ error: "Pick 1 to 60 minutes." });
+  if (!rate) return res.status(400).json({ error: "Missing price." });
+
+  try {
+    const session = await getSession(wearer);
+    const senderName = sentName || String((session && session.display_name) || '').trim();
+    const token = crypto.randomBytes(18).toString('hex');
+    const seconds = minutes * 60;
+    await db.query(
+      `INSERT INTO control_grants (token, wearer_uuid, recipient_uuid, recipient_name, sender_name, seconds_left, hud_mode, rate, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6::int, 'hooker', $7::int, NOW() + ($8::int * INTERVAL '1 second'))`,
+      [token, wearer, recipient, recipientName, senderName || null, seconds, rate, seconds]
+    );
+    return res.json({
+      success: true,
+      minutes,
+      control_url: `${publicBase(req)}/guest/${token}`
+    });
+  } catch (err) {
+    console.error("Visit link error:", err);
+    res.status(500).json({ error: "Could not create the control link." });
+  }
+});
+
 app.post('/api/hud/offer', async (req, res) => {
   const wearer = String(req.body.sl_uuid || '');
   const recipient = String(req.body.recipient_uuid || '');
@@ -2220,7 +2284,7 @@ app.get('/api/hud/toys/:sl_uuid', async (req, res) => {
 });
 
 function hookerNeonSign() {
-  return `<p class="ready-script">The Slut is Ready</p><aside class="neon-sign" aria-hidden="true"><img src="/neon-sign.png?v=beach" alt=""></aside>`;
+  return `<p class="ready-script">The Slut is Ready</p><aside class="neon-sign" aria-hidden="true"><video src="/neon-sign.mp4?v=loop" autoplay muted loop playsinline></video></aside>`;
 }
 
 function ageGate() {
@@ -2245,6 +2309,9 @@ function ageGate() {
         document.body.classList.remove("locked");
         var gate = document.getElementById("ageGate");
         if (gate) gate.remove();
+        document.querySelectorAll("video").forEach(function (clip) {
+          clip.play().catch(function () {});
+        });
       });
       exit.addEventListener("click", function () {
         try { sessionStorage.removeItem("hhn-age-ok"); } catch (e) {}
@@ -2319,13 +2386,13 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
       text-shadow: 0 0 6px #ff4da6, 0 0 16px #ff2a78, 0 0 28px #ff4df0, 0 2px 0 #4a0018;
     }
     body.hooker .neon-sign {
-      position: absolute; z-index: 0; top: 50%; right: -28px; width: 210px; margin: 0;
-      transform: translateY(-48%); pointer-events: none;
+      position: absolute; z-index: 0; top: 108px; right: -28px; width: 210px; margin: 0;
+      pointer-events: none;
     }
-    body.hooker .neon-sign img {
-      width: 100%; height: auto; display: block; border-radius: 0; box-shadow: none;
-      -webkit-mask-image: radial-gradient(ellipse 78% 82% at 58% 46%, #000 28%, transparent 72%);
-      mask-image: radial-gradient(ellipse 78% 82% at 58% 46%, #000 28%, transparent 72%);
+    body.hooker .neon-sign video {
+      width: 100%; height: auto; display: block; border-radius: 0; box-shadow: none; background: transparent;
+      -webkit-mask-image: radial-gradient(ellipse 100% 100% at 54% 46%, #000 0%, rgba(0,0,0,0.72) 16%, rgba(0,0,0,0.28) 38%, transparent 62%);
+      mask-image: radial-gradient(ellipse 100% 100% at 54% 46%, #000 0%, rgba(0,0,0,0.72) 16%, rgba(0,0,0,0.28) 38%, transparent 62%);
     }
     html.age-ok .age-gate { display: none !important; }
     body.hooker.locked > :not(.age-gate) { visibility: hidden; }
