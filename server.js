@@ -1224,9 +1224,25 @@ app.get('/control/:sl_uuid', (req, res) => {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Lovense Controls</title>
+  <title>Hot Hawaiian Nights</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Pacifico&display=swap" rel="stylesheet">
   <style>
     body { font-family: sans-serif; background: #111; color: #eee; max-width: 420px; margin: 0 auto; padding: 24px; }
+    .brand { display: flex; align-items: center; gap: 14px; margin: 0 0 8px; }
+    .brand img { width: 92px; height: 92px; border-radius: 50%; object-fit: cover; flex: none; box-shadow: 0 0 0 2px #f5b942; }
+    .brand h1 {
+      margin: 0;
+      font-family: "Pacifico", cursive;
+      font-size: 30px;
+      font-weight: 400;
+      line-height: 1.05;
+      background: linear-gradient(100deg, #ffe08a, #ff8a1e 40%, #ff3d6e 75%, #ff4df0);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
     label, select, input, button { display: block; width: 100%; margin: 8px 0; font-size: 16px; }
     select, input { padding: 8px; border-radius: 6px; border: 0; }
     button { padding: 12px; border: 0; border-radius: 8px; background: #ff4da6; color: #fff; font-weight: bold; }
@@ -1235,7 +1251,10 @@ app.get('/control/:sl_uuid', (req, res) => {
   </style>
 </head>
 <body>
-  <h1>Toy controls</h1>
+  <header class="brand">
+    <img src="/logo.png" alt="Hot Hawaiian Nights">
+    <h1>HOT HAWAIIAN NIGHTS</h1>
+  </header>
   <p>Move the slider. Power follows while you drag, and the motor keeps running through the change.</p>
   <label for="toy">Toy</label>
   <select id="toy"><option value="">All connected toys</option></select>
