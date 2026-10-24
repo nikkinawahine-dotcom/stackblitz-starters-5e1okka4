@@ -291,7 +291,9 @@ app.post('/api/hud/register', async (req, res) => {
          lovense_token = $3,
          display_name = $4,
          toys = NULL,
-         shared = false`,
+         shared = false,
+         vibe_strength = 0,
+         vibe_until = NOW()`,
       [sl_uuid, sl_http_url, utoken, sl_name || sl_uuid]
     );
 
@@ -550,7 +552,8 @@ app.get('/control/:sl_uuid', (req, res) => {
   <label for="duration">Seconds</label>
   <input id="duration" type="number" min="1" max="60" value="5">
   <button id="vibrate">Vibrate for those seconds</button>
-  <button id="stop" class="secondary">Stop</button>
+    <button id="stop" class="secondary">Stop</button>
+    <button id="disconnect" class="secondary">Disconnect</button>
   <p id="status">Loading toys…</p>
   <script>
     const uuid = ${JSON.stringify(slUuid)};
@@ -700,6 +703,28 @@ app.get('/control/:sl_uuid', (req, res) => {
       desired = 0;
       pump();
     };
+    document.getElementById("disconnect").onclick = async () => {
+      stopClock();
+      strength.value = "0";
+      strengthVal.textContent = "0";
+      desired = 0;
+      lastSent = 0;
+      try {
+        const r = await fetch("/api/hud/disconnect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ wearer_uuid: uuid })
+        });
+        const data = await r.json();
+        if (!r.ok || data.error) {
+          status.textContent = data.error || "Could not disconnect.";
+          return;
+        }
+        status.textContent = "Disconnected. Use Link toy in Second Life for a new QR.";
+      } catch (e) {
+        status.textContent = "Could not disconnect.";
+      }
+    };
     loadToys();
   </script>
 </body>
@@ -720,6 +745,9 @@ app.post('/api/webhook/lovense', async (req, res) => {
     }
 
     const session = userCheck.rows[0];
+    if (session.status === 'disconnected') {
+      return res.sendStatus(200);
+    }
     if (utoken && session.lovense_token && utoken !== session.lovense_token) {
       return res.status(403).send("utoken mismatch.");
     }
@@ -745,6 +773,60 @@ app.post('/api/webhook/lovense', async (req, res) => {
   } catch (err) {
     console.error("Lovense Webhook Error:", err);
     res.sendStatus(500);
+  }
+});
+
+app.post('/api/hud/disconnect', async (req, res) => {
+  const slUuid = req.body.sl_uuid || req.body.wearer_uuid;
+  if (!slUuid) {
+    return res.status(400).json({ error: "Missing wearer_uuid." });
+  }
+
+  try {
+    const session = await getSession(slUuid);
+    if (!session) {
+      return res.status(404).json({ error: "No link to disconnect." });
+    }
+
+    if (session.status === 'connected' && session.connection) {
+      try {
+        await sendToyCommand(slUuid, session.connection, {
+          command: 'Function',
+          action: 'Stop',
+          timeSec: 0,
+          apiVer: 1
+        });
+      } catch (err) {
+        console.error("Stop before disconnect failed:", err.message);
+      }
+    }
+
+    await db.query(
+      `UPDATE active_sessions
+       SET status = 'disconnected',
+           toys = NULL,
+           vibe_strength = 0,
+           vibe_until = NOW()
+       WHERE sl_uuid = $1`,
+      [slUuid]
+    );
+
+    if (session.sl_http_url) {
+      try {
+        await fetch(session.sl_http_url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain' },
+          body: "DISCONNECTED|Link removed until a new QR is requested."
+        });
+      } catch (err) {
+        console.error("SL disconnect notify failed:", err.message);
+      }
+    }
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Disconnect error:", err);
+    res.status(500).json({ error: "Could not disconnect." });
   }
 });
 
