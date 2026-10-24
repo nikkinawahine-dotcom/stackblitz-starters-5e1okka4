@@ -547,7 +547,7 @@ const fades = new Map();
 function percentToLevel(percent) {
   const p = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
   if (p <= 0) return 0;
-  return Math.max(1, Math.round((p * 20) / 100));
+  return Math.max(4, Math.round((p * 20) / 100));
 }
 
 function glideStrengths(from, to) {
@@ -594,22 +594,32 @@ function functionCommand(action, seconds, toyId) {
   return command;
 }
 
-function patternSteps(from, to) {
-  const start = Math.max(0, Math.min(20, from | 0));
-  const end = Math.max(0, Math.min(20, to | 0));
+const SEND_GAP_MS = 200;
+
+function clampLevel(value) {
+  return Math.max(0, Math.min(20, value | 0));
+}
+
+function motorLevel(level) {
+  const n = clampLevel(level);
+  if (n <= 0) return 0;
+  return Math.max(4, n);
+}
+
+function lerpSteps(from, to) {
+  const start = motorLevel(from);
+  const end = motorLevel(to);
   const steps = [];
-  if (start === end) {
-    for (let i = 0; i < 15; i++) steps.push(end);
-    return steps;
-  }
-  const dir = end > start ? 1 : -1;
-  for (let value = start; dir > 0 ? value <= end : value >= end; value += dir) {
-    steps.push(value);
-    if (steps.length >= 40) break;
+  let level = start;
+  steps.push(level);
+  while (level !== end && steps.length < 8) {
+    const diff = end - level;
+    level += Math.sign(diff) * Math.min(4, Math.abs(diff));
+    steps.push(level);
   }
   steps[steps.length - 1] = end;
-  while (steps.length < 12) steps.push(end);
-  return steps.slice(0, 50);
+  while (steps.length < 15) steps.push(end);
+  return steps;
 }
 
 const followers = new Map();
@@ -622,72 +632,119 @@ function stopFollower(uid) {
   followers.delete(uid);
 }
 
+function ensureFollower(uid) {
+  let state = followers.get(uid);
+  if (!state) {
+    state = {
+      gen: 1,
+      lastSent: 0,
+      target: 0,
+      until: 0,
+      sentAt: 0,
+      playUntil: 0,
+      busy: false,
+      timer: null,
+      lastResult: { code: 200, result: true }
+    };
+    followers.set(uid, state);
+  }
+  return state;
+}
+
 async function sendPattern(uid, connection, toyId, steps) {
-  const timeSec = Number((steps.length * 0.1).toFixed(1));
   const pattern = {
     command: 'Pattern',
     rule: 'V:1;F:v;S:100#',
     strength: steps.join(';'),
-    timeSec,
+    timeSec: Number((steps.length * 0.1).toFixed(1)),
     apiVer: 2
   };
   if (toyId) pattern.toy = toyId;
   return sendToyCommand(uid, connection, pattern);
 }
 
-async function runFollow(uid) {
+function scheduleFlush(uid, delay) {
+  const state = followers.get(uid);
+  if (!state || state.timer || state.busy) return;
+  const gap = Math.max(0, state.sentAt + SEND_GAP_MS - Date.now());
+  const wait = Math.max(gap, delay || 0);
+  state.timer = setTimeout(() => {
+    state.timer = null;
+    flushLevel(uid).catch((err) => console.error('Slider flush failed:', err.message));
+  }, wait);
+}
+
+async function flushLevel(uid) {
   const state = followers.get(uid);
   if (!state || state.busy) return;
   if (Date.now() >= state.until || state.target === 0) return;
+  const target = motorLevel(state.target);
+  const same = target === state.lastSent;
+  const holdLeft = (state.playUntil || 0) - Date.now();
+  if (same && holdLeft > 500) {
+    scheduleFlush(uid, holdLeft - 400);
+    return;
+  }
+  if (!same && Date.now() - state.sentAt < SEND_GAP_MS) {
+    scheduleFlush(uid);
+    return;
+  }
+
   const gen = state.gen;
   state.busy = true;
-  const steps = patternSteps(state.level, state.target);
-  const rampMs = steps.length * 100;
+  const steps = same ? Array(15).fill(target) : lerpSteps(state.lastSent, target);
   try {
     const result = await sendPattern(uid, state.connection, state.toyId, steps);
     state.lastResult = result;
+    if (!followers.get(uid) || state.gen !== gen) return;
     if (!commandOk(result)) {
       console.error('Slider pattern rejected:', result && result.code, result && result.message);
-      state.lastResult = result;
-      state.playUntil = Date.now() + 2000;
+      state.sentAt = Date.now();
       return;
     }
-    if (!followers.get(uid) || state.gen !== gen) return;
-    state.level = steps[steps.length - 1];
-    state.playUntil = Date.now() + rampMs;
+    state.lastSent = target;
+    state.sentAt = Date.now();
+    state.playUntil = state.sentAt + steps.length * 100;
   } catch (err) {
     console.error('Slider pattern failed:', err.message);
     state.lastResult = { code: 500, message: err.message };
+    state.sentAt = Date.now();
   } finally {
-    state.busy = false;
-    if (followers.get(uid) && state.gen === gen && Date.now() < state.until && state.target !== 0) {
-      const wait = Math.max(40, (state.playUntil || 0) - Date.now() - 350);
-      state.timer = setTimeout(() => runFollow(uid), wait);
+    const current = followers.get(uid);
+    if (current && current.gen === gen) {
+      current.busy = false;
+      if (Date.now() < current.until && current.target !== 0) {
+        const left = current.playUntil - Date.now();
+        const changed = motorLevel(current.target) !== current.lastSent;
+        scheduleFlush(uid, changed ? 0 : Math.max(0, left - 400));
+      }
     }
   }
 }
 
 async function sendSmoothLevel(uid, connection, toyId, target, seconds) {
   if (target === 0) {
+    const state = followers.get(uid);
     stopFollower(uid);
+    if (state && state.lastSent === 0 && Date.now() - state.sentAt < 1000) {
+      return { code: 200, result: true };
+    }
     return sendToyCommand(uid, connection, functionCommand('Stop', 0, toyId));
   }
 
-  let state = followers.get(uid);
-  if (!state) {
-    state = { gen: 1, level: 0, target: 0, until: 0, busy: false, timer: null, playUntil: 0, lastResult: null };
-    followers.set(uid, state);
-  }
+  const state = ensureFollower(uid);
   state.connection = connection;
   state.toyId = toyId || state.toyId;
-  state.target = target;
+  state.target = motorLevel(target);
   state.until = Date.now() + Math.max(1, seconds) * 1000;
-
-  const patternRunning = state.playUntil && state.playUntil - Date.now() > 500;
-  if (state.busy || patternRunning) {
+  if (state.target === state.lastSent && state.playUntil - Date.now() > 500) {
     return { code: 200, result: true };
   }
-  await runFollow(uid);
+  if (state.busy || Date.now() - state.sentAt < SEND_GAP_MS) {
+    scheduleFlush(uid);
+    return { code: 200, result: true };
+  }
+  await flushLevel(uid);
   return state.lastResult || { code: 200, result: true };
 }
 
@@ -1014,7 +1071,7 @@ app.get('/control/:sl_uuid', (req, res) => {
 </head>
 <body>
   <h1>Toy controls</h1>
-  <p>Drag the slider from 0 to 100. The toy follows in one continuous pattern and does not stop between moves.</p>
+  <p>Drag the slider from 0 to 100. Power eases in small steps, and the page sends at most one update every fifth of a second.</p>
   <label for="toy">Toy</label>
   <select id="toy"><option value="">All connected toys</option></select>
   <label for="strength">Vibration 0–100: <span id="strengthVal">0</span></label>
@@ -1046,7 +1103,7 @@ app.get('/control/:sl_uuid', (req, res) => {
     function toyStep(percent) {
       const p = Math.max(0, Math.min(100, percent));
       if (p <= 0) return 0;
-      return Math.max(1, Math.round((p * 20) / 100));
+      return Math.max(4, Math.round((p * 20) / 100));
     }
 
     function allowedSeconds() {
@@ -1064,21 +1121,22 @@ app.get('/control/:sl_uuid', (req, res) => {
       sendTimer = setTimeout(() => {
         sendTimer = null;
         const level = desired;
+        const step = toyStep(level);
         const left = level === 0 ? 0 : remaining();
-        if (level > 0 && left <= 0) {
-          if (desired !== level) queueSend();
+        if (level > 0 && left <= 0) return;
+        if (step === lastSent) {
+          if (toyStep(desired) !== lastSent) queueSend();
           return;
         }
-        postCommand(commandBody(level, left)).then(() => {
-          lastSent = level;
-          status.textContent = level === 0
-            ? "Stopped."
-            : ("Strength " + level + " of 100, step " + toyStep(level) + " of 20");
-        }).catch((e) => {
+        lastSent = step;
+        postCommand(commandBody(level, left)).catch((e) => {
+          lastSent = -1;
           status.textContent = e.message || "Command failed.";
         });
-        if (desired !== level) queueSend();
-      }, 80);
+        status.textContent = level === 0
+          ? "Stopped."
+          : ("Strength " + level + " of 100, step " + step + " of 20");
+      }, 200);
     }
 
     strength.oninput = () => {
