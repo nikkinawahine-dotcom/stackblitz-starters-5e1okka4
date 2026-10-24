@@ -133,6 +133,7 @@ async function ensureSchema() {
   await db.query(`ALTER TABLE control_grants ADD COLUMN IF NOT EXISTS seconds_left INTEGER`);
   await db.query(`ALTER TABLE control_grants ADD COLUMN IF NOT EXISTS hud_mode TEXT DEFAULT 'normal'`);
   await db.query(`ALTER TABLE control_grants ADD COLUMN IF NOT EXISTS running_since TIMESTAMPTZ`);
+  await db.query(`ALTER TABLE control_grants ADD COLUMN IF NOT EXISTS rate INTEGER DEFAULT 30`);
   await db.query(`CREATE TABLE IF NOT EXISTS control_offers (
     id TEXT PRIMARY KEY,
     wearer_uuid TEXT NOT NULL,
@@ -141,9 +142,11 @@ async function ensureSchema() {
     sender_name TEXT,
     seconds INTEGER NOT NULL,
     price INTEGER NOT NULL,
+    rate INTEGER NOT NULL DEFAULT 30,
     status TEXT NOT NULL DEFAULT 'pending',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
+  await db.query(`ALTER TABLE control_offers ADD COLUMN IF NOT EXISTS rate INTEGER DEFAULT 30`);
   await db.query(`UPDATE control_grants
     SET seconds_left = GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (expires_at - NOW())))::int)
     WHERE seconds_left IS NULL`);
@@ -1111,7 +1114,7 @@ async function resolveControl(body) {
   if (token) {
     if (!token || token.length > 80) return { error: "This control link is not valid.", status: 404 };
     const result = await db.query(
-      `SELECT wearer_uuid, expires_at, sender_name, seconds_left, running_since, hud_mode FROM control_grants WHERE token = $1`,
+      `SELECT wearer_uuid, expires_at, sender_name, seconds_left, running_since, hud_mode, rate FROM control_grants WHERE token = $1`,
       [token]
     );
     if (!result.rows.length) return { error: "This control link is not valid.", status: 404 };
@@ -1124,6 +1127,19 @@ async function resolveControl(body) {
           [token]
         );
       }
+      if (hudMode(row.hud_mode) === 'hooker') {
+        return {
+          wearer: row.wearer_uuid,
+          guest: true,
+          expiresAt: new Date(row.expires_at),
+          senderName: row.sender_name || '',
+          token,
+          secondsLeft: 0,
+          running: false,
+          hudMode: 'hooker',
+          rate: Math.max(1, Number(row.rate) || LINDENS_PER_MINUTE)
+        };
+      }
       return { error: "This control time is used up.", status: 403 };
     }
     return {
@@ -1134,7 +1150,8 @@ async function resolveControl(body) {
       token,
       secondsLeft,
       running: !!row.running_since,
-      hudMode: hudMode(row.hud_mode)
+      hudMode: hudMode(row.hud_mode),
+      rate: Math.max(1, Number(row.rate) || LINDENS_PER_MINUTE)
     };
   }
   const wearer = String((body && (body.wearer_uuid || body.sl_uuid)) || '');
@@ -1148,8 +1165,12 @@ function hudMode(raw) {
 
 const LINDENS_PER_MINUTE = 30;
 
-function offerPrice(seconds) {
-  return Math.max(1, Math.round((seconds / 60) * LINDENS_PER_MINUTE));
+function offerPrice(seconds, rate) {
+  return Math.max(1, Math.round((seconds / 60) * rate));
+}
+
+function secondsForPayment(amount, rate) {
+  return Math.max(1, Math.min(86400, Math.round((amount / rate) * 60)));
 }
 
 function offerLabel(seconds) {
@@ -1511,20 +1532,22 @@ app.post('/api/hud/offer', async (req, res) => {
       return res.status(400).json({ error: "Switch to hooker mode before sending an offer." });
     }
     const senderName = sentName || String(session.display_name || '').trim() || 'Someone';
-    const price = offerPrice(seconds);
+    const rate = Math.min(10000, Math.max(1, parseInt(req.body.per_minute, 10) || LINDENS_PER_MINUTE));
+    const price = offerPrice(seconds, rate);
     const label = offerLabel(seconds);
     const id = crypto.randomBytes(18).toString('hex');
     await db.query(`UPDATE control_offers SET status = 'cancelled' WHERE wearer_uuid = $1 AND status = 'pending'`, [wearer]);
     await db.query(
-      `INSERT INTO control_offers (id, wearer_uuid, recipient_uuid, recipient_name, sender_name, seconds, price)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [id, wearer, recipient, recipientName, senderName, seconds, price]
+      `INSERT INTO control_offers (id, wearer_uuid, recipient_uuid, recipient_name, sender_name, seconds, price, rate)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [id, wearer, recipient, recipientName, senderName, seconds, price, rate]
     );
     return res.json({
       success: true,
       offer_id: id,
       price,
       seconds,
+      rate,
       label,
       offer_url: `${publicBase(req)}/offer/${id}`
     });
@@ -1560,9 +1583,9 @@ app.post('/api/hud/offer/accept', async (req, res) => {
 
     const token = crypto.randomBytes(18).toString('hex');
     await db.query(
-      `INSERT INTO control_grants (token, wearer_uuid, recipient_uuid, recipient_name, sender_name, seconds_left, hud_mode, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6, 'hooker', NOW() + ($6 * INTERVAL '1 second'))`,
-      [token, wearer, recipient, offer.recipient_name, offer.sender_name, offer.seconds]
+      `INSERT INTO control_grants (token, wearer_uuid, recipient_uuid, recipient_name, sender_name, seconds_left, hud_mode, rate, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, 'hooker', $7, NOW() + ($6 * INTERVAL '1 second'))`,
+      [token, wearer, recipient, offer.recipient_name, offer.sender_name, offer.seconds, Math.max(1, Number(offer.rate) || LINDENS_PER_MINUTE)]
     );
     await db.query(`UPDATE control_offers SET status = 'paid' WHERE id = $1`, [offerId]);
     return res.json({
@@ -1574,6 +1597,47 @@ app.post('/api/hud/offer/accept', async (req, res) => {
   } catch (err) {
     console.error("Offer accept error:", err);
     res.status(500).json({ error: "Could not start the paid time." });
+  }
+});
+
+app.post('/api/hud/offer/extend', async (req, res) => {
+  const wearer = String(req.body.sl_uuid || '');
+  const recipient = String(req.body.recipient_uuid || '');
+  const amount = parseInt(req.body.amount, 10);
+  const rate = Math.min(10000, Math.max(1, parseInt(req.body.per_minute, 10) || LINDENS_PER_MINUTE));
+  if (!wearer || !recipient) return res.status(400).json({ error: "Missing avatar." });
+  if (!amount || amount < 1) return res.status(400).json({ error: "Missing payment." });
+
+  try {
+    const found = await db.query(
+      `SELECT token, seconds_left, running_since
+       FROM control_grants
+       WHERE wearer_uuid = $1 AND recipient_uuid = $2 AND hud_mode = 'hooker'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [wearer, recipient]
+    );
+    if (!found.rows.length) return res.status(404).json({ error: "No paid time to add to." });
+    const added = secondsForPayment(amount, rate);
+    const updated = await db.query(
+      `UPDATE control_grants
+       SET seconds_left = COALESCE(seconds_left, 0) + $2,
+           rate = $3
+       WHERE token = $1
+       RETURNING seconds_left, running_since`,
+      [found.rows[0].token, added, rate]
+    );
+    const row = updated.rows[0];
+    return res.json({
+      success: true,
+      seconds_added: added,
+      seconds_left: grantRemaining(row),
+      label: offerLabel(added),
+      rate
+    });
+  } catch (err) {
+    console.error("Offer extend error:", err);
+    res.status(500).json({ error: "Could not add the time." });
   }
 });
 
@@ -1598,7 +1662,7 @@ app.post('/api/hud/offer/decline', async (req, res) => {
 app.get('/offer/:id', async (req, res) => {
   try {
     const found = await db.query(
-      `SELECT sender_name, seconds, price, status, created_at
+      `SELECT sender_name, seconds, price, rate, status, created_at
        FROM control_offers WHERE id = $1`,
       [String(req.params.id || '')]
     );
@@ -1609,6 +1673,7 @@ app.get('/offer/:id', async (req, res) => {
     const fresh = offer.status === 'pending' && (Date.now() - new Date(offer.created_at).getTime()) < 15 * 60 * 1000;
     const name = String(offer.sender_name || 'She').replace(/[&<>"]/g, '');
     const label = offerLabel(offer.seconds);
+    const rate = Math.max(1, Number(offer.rate) || LINDENS_PER_MINUTE);
     const note = fresh
       ? `Pay her collar L$${offer.price}. That pays her for this time.`
       : "This offer is closed.";
@@ -1632,7 +1697,7 @@ app.get('/offer/:id', async (req, res) => {
   <p class="name">${name}</p>
   <p>${name} is offering ${label}.</p>
   <p class="price">L$${offer.price}</p>
-  <p>L$${LINDENS_PER_MINUTE} a minute.</p>
+  <p>L$${rate} a minute.</p>
   <p>${note}</p>
 </body>
 </html>`);
@@ -1660,6 +1725,7 @@ app.get('/api/hud/grant/:token', async (req, res) => {
       patterns: patterns.rows,
       seconds_left: actor.secondsLeft,
       running: actor.running,
+      rate: actor.rate || LINDENS_PER_MINUTE,
       owner_name: actor.senderName || session.display_name || ''
     });
   } catch (err) {
@@ -1725,7 +1791,7 @@ app.get('/api/hud/toys/:sl_uuid', async (req, res) => {
   }
 });
 
-function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSeconds, grantRunning, pageMode) {
+function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSeconds, grantRunning, pageMode, payRate) {
   res.type('html').send(`<!DOCTYPE html>
 <html>
 <head>
@@ -1789,6 +1855,7 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
   <p id="intro">Move the slider. The motor stays on and the strength eases while you drag.</p>
   <button type="button" id="hudMode" class="secondary">Normal HUD</button>
   <p id="grantLine" class="pattern-note"></p>
+  <p id="addTime" class="pattern-note" hidden></p>
   <label id="toyLabel" for="toy">Toy</label>
   <select id="toy"><option value="">All connected toys</option></select>
   <label id="strengthLabel" for="strength">Vibration 0–100: <span id="strengthVal">0</span></label>
@@ -1829,6 +1896,7 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
     let grantRunning = ${grantRunning ? "true" : "false"};
     let grantSync = Date.now();
     const pageMode = ${JSON.stringify(pageMode || "normal")};
+    const payRate = ${Math.max(1, Number(payRate) || 30)};
     let sentMode = "normal";
 
     function withActor(body) {
@@ -2334,10 +2402,18 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
       const secs = left % 60;
       const clockText = mins + ":" + (secs < 10 ? "0" : "") + secs;
       if (left <= 0) {
-        line.textContent = "Control time is used up.";
-        status.textContent = "Control time is used up.";
+        line.textContent = pageMode === "hooker"
+          ? "Clock is at 0:00. Pay her collar to add time."
+          : "Control time is used up.";
+        status.textContent = pageMode === "hooker"
+          ? "Pay her collar to add time."
+          : "Control time is used up.";
         document.querySelectorAll("button, input, select").forEach((el) => { el.disabled = true; });
         return;
+      }
+      document.querySelectorAll("button, input, select").forEach((el) => { el.disabled = false; });
+      if (pageMode === "hooker" && status.textContent === "Pay her collar to add time.") {
+        status.textContent = "Drag it. She stays on.";
       }
       line.textContent = pageMode === "hooker"
         ? (grantRunning
@@ -2383,6 +2459,21 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
         document.getElementById("mineHeading").textContent = ownerName ? (ownerName + "'s specials") : "Specials";
         document.getElementById("mineNote").textContent = "What she saved.";
         document.getElementById("stop").textContent = "Hold up";
+        const addTime = document.getElementById("addTime");
+        addTime.hidden = false;
+        addTime.textContent = "Pay her collar to add time. L$" + payRate + " a minute.";
+        setInterval(() => {
+          fetch("/api/hud/grant/" + encodeURIComponent(guestToken))
+            .then((r) => r.json())
+            .then((data) => {
+              if (data && data.seconds_left != null) applyGrant(data);
+              if (data && data.rate) {
+                addTime.hidden = false;
+                addTime.textContent = "Pay her collar to add time. L$" + data.rate + " a minute.";
+              }
+            })
+            .catch(() => {});
+        }, 4000);
       }
       tickGrant();
       setInterval(tickGrant, 1000);
@@ -2423,6 +2514,11 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
           .then((r) => r.json())
           .then((data) => {
             if (data && data.seconds_left != null) applyGrant(data);
+            if (data && data.rate && pageMode === "hooker") {
+              const addTime = document.getElementById("addTime");
+              addTime.hidden = false;
+              addTime.textContent = "Pay her collar to add time. L$" + data.rate + " a minute.";
+            }
             else if (data && data.error) {
               grantLeft = 0;
               grantRunning = false;
@@ -2459,7 +2555,7 @@ app.get('/guest/:token', async (req, res) => {
     if (actor.error) return res.status(actor.status).type('html').send(guestMessage(actor.error));
     const session = await getSession(actor.wearer);
     const senderName = actor.senderName || (session && session.display_name) || "";
-    sendControlPage(res, "", req.params.token, 0, senderName, actor.secondsLeft, actor.running, actor.hudMode);
+    sendControlPage(res, "", req.params.token, 0, senderName, actor.secondsLeft, actor.running, actor.hudMode, actor.rate);
   } catch (err) {
     console.error(err);
     res.status(500).type('html').send(guestMessage("Could not open this control link."));
