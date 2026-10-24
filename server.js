@@ -687,22 +687,48 @@ function functionCommand(action, seconds, toyId) {
 }
 
 const STEP_MS = 100;
-const MIN_GAP_MS = 500;
+const MIN_GAP_MS = 1000;
 
 function clampLevel(value) {
   return Math.max(0, Math.min(20, value | 0));
 }
 
 function buildGlide(from, to) {
+  const start = clampLevel(from);
   const end = clampLevel(to);
-  let level = clampLevel(from);
-  const steps = [level];
-  while (level !== end && steps.length < 50) {
-    level += Math.sign(end - level);
-    steps.push(level);
+  if (start === end) return Array(20).fill(start);
+  const sign = Math.sign(end - start);
+  const dwellFor = (value, index, last) => {
+    if (index === 0 && value === 0) return 1;
+    if (value > 0 && value < 4 && value !== last) return 1;
+    return 4;
+  };
+  const levels = [start];
+  let level = start;
+  while (level !== end && levels.length < 13) {
+    const next = level + sign;
+    const trial = levels.map((value, index) => dwellFor(value, index, next));
+    trial.push(dwellFor(next, levels.length, next));
+    if (trial.reduce((sum, n) => sum + n, 0) > 50) break;
+    level = next;
+    levels.push(level);
   }
-  while (steps.length < 12) steps.push(end);
-  return steps.slice(0, 50);
+  const last = levels[levels.length - 1];
+  const counts = levels.map((value, index) => dwellFor(value, index, last));
+  let extra = Math.min(10, 50 - counts.reduce((sum, n) => sum + n, 0));
+  let side = 0;
+  while (extra > 0) {
+    const index = side % 2 === 0 ? counts.length - 1 : 0;
+    counts[index] += 1;
+    extra -= 1;
+    side += 1;
+  }
+  const steps = [];
+  for (let i = 0; i < levels.length; i++) {
+    for (let n = 0; n < counts[i] && steps.length < 50; n++) steps.push(levels[i]);
+  }
+  while (steps.length < 12) steps.push(last);
+  return steps;
 }
 
 function playingLevel(state) {
@@ -713,15 +739,16 @@ function playingLevel(state) {
 
 function glideCovers(state, target) {
   if (!state || !state.steps || !state.playStarted) return false;
-  if (Date.now() >= state.playUntil - 250) return false;
+  if (state.playUntil - Date.now() <= 350) return false;
   const now = playingLevel(state);
   const end = state.steps[state.steps.length - 1];
   const goal = clampLevel(target);
-  if (now === goal && end === goal) return true;
-  if (now === end) return false;
-  const toward = Math.sign(goal - now);
-  if (toward === 0 || Math.sign(end - now) !== toward) return false;
-  return end === goal || Math.sign(goal - end) === toward;
+  const wanted = Math.sign(goal - now);
+  if (wanted === 0) return true;
+  const traveling = Math.sign(end - now);
+  if (traveling === wanted) return true;
+  if (Date.now() - state.playStarted < 900) return true;
+  return false;
 }
 
 const followers = new Map();
@@ -801,7 +828,7 @@ async function planLevel(uid) {
     return;
   }
   if (glideCovers(state, target)) {
-    schedulePlan(uid, Math.max(200, Math.min(1000, state.playUntil - Date.now() - 300)));
+    schedulePlan(uid, Math.max(250, Math.min(700, state.playUntil - Date.now() - 350)));
     return;
   }
 
@@ -868,7 +895,7 @@ async function planLevel(uid) {
       current.busy = false;
       if (Date.now() < current.until || clampLevel(current.target) === 0) {
         const wait = glideCovers(current, current.target)
-          ? Math.max(200, Math.min(800, current.playUntil - Date.now() - 300))
+          ? Math.max(250, Math.min(700, current.playUntil - Date.now() - 350))
           : Math.max(0, current.nextSendAt - Date.now());
         schedulePlan(uid, wait);
       }
@@ -1227,7 +1254,7 @@ app.get('/control/:sl_uuid', (req, res) => {
 </head>
 <body>
   <h1>Toy controls</h1>
-  <p>Drag the slider from 0 to 100. The motor eases up or down one step at a time, so the change stays gradual.</p>
+  <p>Drag the slider from 0 to 100. The motor eases to that strength slowly, and it keeps going until the change is finished.</p>
   <label for="toy">Toy</label>
   <select id="toy"><option value="">All connected toys</option></select>
   <label for="strength">Vibration 0–100: <span id="strengthVal">0</span></label>
@@ -1274,29 +1301,36 @@ app.get('/control/:sl_uuid', (req, res) => {
     }
 
     function queueSend(immediateStop) {
-      sendImmediate = sendImmediate || !!immediateStop;
-      if (sendTimer) return;
-      sendTimer = setTimeout(() => {
-        const immediate = sendImmediate;
+      if (immediateStop) {
+        if (sendTimer) clearTimeout(sendTimer);
         sendTimer = null;
         sendImmediate = false;
+        desired = 0;
+        lastSent = 0;
+        postCommand(commandBody(0, 0, true)).catch((e) => {
+          lastSent = -1;
+          status.textContent = e.message || "Command failed.";
+        });
+        status.textContent = "Stopped.";
+        return;
+      }
+      if (sendTimer) clearTimeout(sendTimer);
+      sendTimer = setTimeout(() => {
+        sendTimer = null;
         const level = desired;
         const step = toyStep(level);
         const left = level === 0 ? 0 : remaining();
         if (level > 0 && left <= 0) return;
-        if (!immediate && step === lastSent) {
-          if (toyStep(desired) !== lastSent) queueSend(false);
-          return;
-        }
+        if (step === lastSent) return;
         lastSent = step;
-        postCommand(commandBody(level, left, level === 0 && immediate)).catch((e) => {
+        postCommand(commandBody(level, left, false)).catch((e) => {
           lastSent = -1;
           status.textContent = e.message || "Command failed.";
         });
         status.textContent = level === 0
-          ? (immediate ? "Stopped." : "Easing off.")
+          ? "Easing off."
           : ("Strength " + level + " of 100");
-      }, 200);
+      }, 400);
     }
 
     strength.oninput = () => {
@@ -1428,7 +1462,7 @@ app.get('/control/:sl_uuid', (req, res) => {
         localCommand = data.local_command || "";
         showToys(data.toys);
         status.textContent = (data.toys && data.toys.length)
-          ? "Drag the slider. Power eases up and down instead of jumping."
+          ? "Drag the slider, then pause. The motor eases to that strength."
           : "No toys reported yet. Keep Lovense Connect open and refresh.";
       } catch (e) {
         status.textContent = "Failed to load toys.";
