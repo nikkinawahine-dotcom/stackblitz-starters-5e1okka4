@@ -242,9 +242,13 @@ function toysFromCommand(data) {
 function mergeBattery(base, extra) {
   if (!extra || !extra.length) return base;
   const byId = new Map(extra.filter((toy) => toy.id).map((toy) => [toy.id, toy]));
+  const only = extra.length === 1 && base.length === 1 ? extra[0] : null;
   if (!base.length) return extra;
   return base.map((toy) => {
-    const live = byId.get(toy.id) || extra.find((item) => item.name === toy.name);
+    const live = byId.get(toy.id)
+      || extra.find((item) => item.id && item.id === toy.id)
+      || extra.find((item) => item.name && toy.name && String(item.name).toLowerCase() === String(toy.name).toLowerCase())
+      || only;
     if (!live) return toy;
     return {
       ...toy,
@@ -266,7 +270,8 @@ async function rememberBatteries(session, toys) {
   let changed = false;
   for (const toy of toys) {
     if (toy.battery == null) continue;
-    const key = Object.keys(toysObj).find((id) => id === toy.id || (toysObj[id] && toysObj[id].id === toy.id));
+    let key = Object.keys(toysObj).find((id) => id === toy.id || (toysObj[id] && toysObj[id].id === toy.id));
+    if (!key && Object.keys(toysObj).length === 1) key = Object.keys(toysObj)[0];
     if (!key || toysObj[key].battery === toy.battery) continue;
     toysObj[key] = { ...toysObj[key], battery: toy.battery };
     changed = true;
@@ -279,30 +284,37 @@ async function rememberBatteries(session, toys) {
   );
 }
 
+const getToysAt = new Map();
+
+function scheduleGetToys(session) {
+  const uid = session.sl_uuid;
+  if (Date.now() - (getToysAt.get(uid) || 0) < 60000) return;
+  getToysAt.set(uid, Date.now());
+  sendLovenseCommand(uid, { command: 'GetToys', apiVer: 1 })
+    .then(async (live) => {
+      const parsed = toysFromCommand(live);
+      if (!parsed.some((toy) => toy.battery != null)) {
+        const data = live && live.data;
+        const keys = data && typeof data === 'object' ? Object.keys(data) : [];
+        console.log('GetToys had no battery', live && live.code, keys.join(','));
+        return;
+      }
+      const fresh = await getSession(uid);
+      if (!fresh || fresh.status !== 'connected') return;
+      const toys = mergeBattery(listToys(fresh.connection), parsed);
+      batteryCache.set(uid, { at: Date.now(), toys });
+      await rememberBatteries(fresh, toys);
+      console.log('Lovense battery', toys.map((toy) => ({ name: toy.name, battery: toy.battery })));
+    })
+    .catch((err) => console.error('GetToys for titler failed:', err.message));
+}
+
 async function toysForSession(session) {
   watchBattery(session);
   let toys = listToys(session.connection);
   const cached = batteryCache.get(session.sl_uuid);
-  if (cached && Date.now() - cached.at < 20000) {
-    return mergeBattery(toys, cached.toys);
-  }
-  if (toys.some((toy) => toy.battery == null)) {
-    try {
-      const live = await sendLovenseCommand(session.sl_uuid, { command: 'GetToys', apiVer: 1 });
-      const parsed = toysFromCommand(live);
-      if (parsed.length) toys = mergeBattery(toys, parsed);
-    } catch (err) {
-      console.error('GetToys for titler failed:', err.message);
-    }
-  }
-  batteryCache.set(session.sl_uuid, { at: Date.now(), toys });
-  if (toys.some((toy) => toy.battery != null)) {
-    try {
-      await rememberBatteries(session, toys);
-    } catch (err) {
-      console.error('Saving battery failed:', err.message);
-    }
-  }
+  if (cached) toys = mergeBattery(toys, cached.toys);
+  if (toys.some((toy) => toy.battery == null)) scheduleGetToys(session);
   return toys;
 }
 
@@ -312,15 +324,15 @@ function stopBatteryWatch(uid) {
   const watcher = batteryWatchers.get(uid);
   if (!watcher) return;
   watcher.stopped = true;
+  if (watcher.close) watcher.close();
   batteryWatchers.delete(uid);
 }
 
 function watchBattery(session) {
   if (!session || session.status !== 'connected' || !LOVENSE_TOKEN) return;
   const existing = batteryWatchers.get(session.sl_uuid);
-  if (existing && existing.retryAt > Date.now()) return;
   if (existing && !existing.stopped) return;
-  const watcher = { stopped: false, retryAt: 0 };
+  const watcher = { stopped: false, seen: new Set() };
   batteryWatchers.set(session.sl_uuid, watcher);
   readBatterySocket(session.sl_uuid, session.display_name, watcher).catch((err) => {
     console.error('Battery watch failed:', err.message);
@@ -329,7 +341,7 @@ function watchBattery(session) {
 
 async function saveSocketBattery(uid, toyList) {
   const incoming = (Array.isArray(toyList) ? toyList : []).map((toy) => ({
-    id: toy.id,
+    id: toy.id || toy.toyId,
     name: toy.nickname || toy.nickName || toy.name || toy.toyType,
     battery: toyBattery(toy)
   })).filter((toy) => toy.battery != null);
@@ -342,98 +354,178 @@ async function saveSocketBattery(uid, toyList) {
   console.log('Lovense battery', toys.map((toy) => ({ name: toy.name, battery: toy.battery })));
 }
 
-function socketPackets(payload) {
-  return String(payload || '').split('\u001e').filter(Boolean);
+function batteriesFromPayload(data) {
+  const found = [];
+  const lists = [];
+  if (Array.isArray(data)) lists.push(data);
+  if (data && typeof data === 'object') {
+    if (Array.isArray(data.toyList)) lists.push(data.toyList);
+    if (data.data && Array.isArray(data.data.toyList)) lists.push(data.data.toyList);
+    if (data.type === 'battery-changed') {
+      const value = data.data && data.data.value != null ? data.data.value : data.value;
+      const battery = toyBattery({ battery: value });
+      if (battery != null) {
+        found.push({ id: data.toyId || data.id, name: data.name, battery });
+      }
+    }
+  }
+  for (const list of lists) {
+    for (const toy of list) {
+      if (!toy || typeof toy !== 'object') continue;
+      const battery = toyBattery(toy);
+      if (battery == null) continue;
+      found.push({
+        id: toy.id || toy.toyId,
+        name: toy.nickname || toy.nickName || toy.name || toy.toyType,
+        battery
+      });
+    }
+  }
+  if (found.length) return found;
+  return collectBatteries(data);
+}
+
+function decodeEnginePayload(text) {
+  const raw = String(text || '');
+  if (!raw) return [];
+  if (raw.includes('\u001e')) return raw.split('\u001e').filter(Boolean);
+  if (/^\d+:/.test(raw)) {
+    const packets = [];
+    let i = 0;
+    while (i < raw.length) {
+      const colon = raw.indexOf(':', i);
+      if (colon < 0) break;
+      const n = parseInt(raw.slice(i, colon), 10);
+      if (!Number.isFinite(n) || n < 0) break;
+      const msg = raw.slice(colon + 1, colon + 1 + n);
+      if (msg.length !== n) break;
+      packets.push(msg);
+      i = colon + 1 + n;
+    }
+    if (packets.length) return packets;
+  }
+  return [raw];
+}
+
+function socketEvent(packet) {
+  if (!packet || !packet.startsWith('42')) return null;
+  try {
+    const parsed = JSON.parse(packet.slice(2));
+    let data = parsed[1];
+    if (typeof data === 'string') {
+      try { data = JSON.parse(data); } catch (err) { /* device info arrives as a JSON string */ }
+    }
+    return { name: parsed[0], data };
+  } catch (err) {
+    return null;
+  }
+}
+
+function socketBase(socketIoUrl, socketIoPath) {
+  const path = socketIoPath || '/socket.io';
+  return `${String(socketIoUrl).replace(/\/$/, '')}${String(path).startsWith('/') ? '' : '/'}${path}`;
+}
+
+async function handleSocketPacket(uid, watcher, packet) {
+  const event = socketEvent(packet);
+  if (!event) return;
+  const found = batteriesFromPayload(event.data);
+  if (found.length) {
+    await saveSocketBattery(uid, found);
+    return;
+  }
+  if (event.name && watcher.seen && !watcher.seen.has(event.name)) {
+    watcher.seen.add(event.name);
+    console.log('Lovense socket event', event.name);
+  }
+}
+
+async function pollBatterySocket(base, uid, watcher) {
+  let opened = null;
+  for (const eio of [3, 4]) {
+    const openRes = await fetch(`${base}/?EIO=${eio}&transport=polling&t=${Date.now()}`, {
+      signal: AbortSignal.timeout(8000)
+    });
+    const openText = await openRes.text();
+    const openPacket = decodeEnginePayload(openText).find((packet) => packet.startsWith('0'));
+    if (!openRes.ok || !openPacket) continue;
+    let open;
+    try { open = JSON.parse(openPacket.slice(1)); } catch (err) { continue; }
+    if (!open || !open.sid) continue;
+    opened = { eio, sid: open.sid, pingInterval: open.pingInterval || 25000, pingTimeout: open.pingTimeout || 20000 };
+    break;
+  }
+  if (!opened) throw new Error('Lovense socket handshake failed');
+
+  const { eio, sid } = opened;
+  const post = async (packet) => {
+    const body = eio === 3 ? `${packet.length}:${packet}` : packet;
+    await fetch(`${base}/?EIO=${eio}&transport=polling&sid=${encodeURIComponent(sid)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+      body,
+      signal: AbortSignal.timeout(8000)
+    });
+  };
+  await post('40');
+  console.log('Lovense socket open', eio);
+
+  const deadline = Date.now() + 6 * 60 * 60 * 1000;
+  while (!watcher.stopped && Date.now() < deadline) {
+    const poll = await fetch(`${base}/?EIO=${eio}&transport=polling&sid=${encodeURIComponent(sid)}&t=${Date.now()}`, {
+      signal: AbortSignal.timeout(opened.pingInterval + opened.pingTimeout)
+    });
+    const text = await poll.text();
+    if (!poll.ok) break;
+    for (const packet of decodeEnginePayload(text)) {
+      if (packet === '2') {
+        await post('3');
+        continue;
+      }
+      if (packet === '1' || packet.startsWith('41')) return;
+      await handleSocketPacket(uid, watcher, packet);
+    }
+  }
 }
 
 async function readBatterySocket(uid, displayName, watcher) {
-  try {
-    const tokenRes = await fetch('https://api.lovense-api.com/api/basicApi/getToken', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        token: LOVENSE_TOKEN,
-        uid,
-        uname: displayName || uid
-      }),
-      signal: AbortSignal.timeout(8000)
-    });
-    const tokenData = await tokenRes.json();
-    const authToken = tokenData && tokenData.data && tokenData.data.authToken;
-    if (!authToken) {
-      console.error('Lovense socket token failed:', tokenData && tokenData.code, tokenData && tokenData.message);
-      return;
-    }
-
-    const urlRes = await fetch('https://api.lovense-api.com/api/basicApi/getSocketUrl', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ platform: PLATFORM_NAME, authToken }),
-      signal: AbortSignal.timeout(8000)
-    });
-    const urlData = await urlRes.json();
-    const socketIoUrl = urlData && urlData.data && urlData.data.socketIoUrl;
-    const socketIoPath = urlData && urlData.data && urlData.data.socketIoPath;
-    if (!socketIoUrl) {
-      console.error('Lovense socket url failed:', urlData && urlData.code, urlData && urlData.message);
-      return;
-    }
-
-    const base = `${String(socketIoUrl).replace(/\/$/, '')}${String(socketIoPath || '/socket.io').startsWith('/') ? '' : '/'}${socketIoPath || '/socket.io'}`;
-    const openRes = await fetch(`${base}/?EIO=4&transport=polling`, { signal: AbortSignal.timeout(8000) });
-    const openText = await openRes.text();
-    const openPacket = socketPackets(openText)[0] || openText;
-    const open = JSON.parse(openPacket.replace(/^\d/, ''));
-    const sid = open.sid;
-    const post = async (body) => {
-      await fetch(`${base}/?EIO=4&transport=polling&sid=${encodeURIComponent(sid)}`, {
+  while (!watcher.stopped) {
+    try {
+      const tokenRes = await fetch('https://api.lovense-api.com/api/basicApi/getToken', {
         method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
-        body,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: LOVENSE_TOKEN,
+          uid,
+          uname: displayName || uid
+        }),
         signal: AbortSignal.timeout(8000)
       });
-    };
-    await post('40');
-    await post(`42${JSON.stringify(['basicapi_send_toy_command_ts', { command: 'GetToys', apiVer: 1 }])}`);
-
-    const deadline = Date.now() + 10 * 60 * 1000;
-    while (!watcher.stopped && Date.now() < deadline) {
-      const poll = await fetch(`${base}/?EIO=4&transport=polling&sid=${encodeURIComponent(sid)}`, {
-        signal: AbortSignal.timeout((open.pingInterval || 25000) + 5000)
-      });
-      const text = await poll.text();
-      for (const packet of socketPackets(text)) {
-        if (packet === '2' || packet.startsWith('2')) {
-          await post('3');
-          continue;
-        }
-        if (!packet.startsWith('42')) continue;
-        let eventName = '';
-        let data = null;
-        try {
-          const parsed = JSON.parse(packet.slice(2));
-          eventName = parsed[0];
-          data = parsed[1];
-          if (typeof data === 'string') {
-            try { data = JSON.parse(data); } catch (err) { /* keep string */ }
-          }
-        } catch (err) {
-          continue;
-        }
-        const toyList = data && (data.toyList || (data.data && data.data.toyList));
-        if (toyList) await saveSocketBattery(uid, toyList);
-        else {
-          const found = collectBatteries(data);
-          if (found.length) await saveSocketBattery(uid, found);
-          else if (eventName) console.log('Lovense socket event', eventName);
+      const tokenData = await tokenRes.json();
+      const authToken = tokenData && tokenData.data && tokenData.data.authToken;
+      if (!authToken) {
+        console.error('Lovense socket token failed:', tokenData && tokenData.code, tokenData && tokenData.message);
+      } else {
+        const urlRes = await fetch('https://api.lovense-api.com/api/basicApi/getSocketUrl', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ platform: PLATFORM_NAME, authToken }),
+          signal: AbortSignal.timeout(8000)
+        });
+        const urlData = await urlRes.json();
+        const socketIoUrl = urlData && urlData.data && urlData.data.socketIoUrl;
+        const socketIoPath = urlData && urlData.data && urlData.data.socketIoPath;
+        if (!socketIoUrl) {
+          console.error('Lovense socket url failed:', urlData && urlData.code, urlData && urlData.message);
+        } else if (!watcher.stopped) {
+          await pollBatterySocket(socketBase(socketIoUrl, socketIoPath), uid, watcher);
         }
       }
+    } catch (err) {
+      if (!watcher.stopped) console.error('Battery watch failed:', err.message);
     }
-  } finally {
-    if (batteryWatchers.get(uid) === watcher) {
-      watcher.stopped = true;
-      watcher.retryAt = Date.now() + 60000;
-    }
+    if (watcher.stopped) return;
+    await new Promise((resolve) => setTimeout(resolve, 15000));
   }
 }
 
@@ -1039,10 +1131,7 @@ app.get('/api/hud/toys/:sl_uuid', async (req, res) => {
       return res.status(404).json({ error: "Toy is not connected." });
     }
 
-    const toys = mergeBattery(
-      listToys(session.connection),
-      (batteryCache.get(session.sl_uuid) || {}).toys || []
-    );
+    const toys = await toysForSession(session);
     const local = localCommandUrl(session.connection);
 
     return res.json({ toys, local_command: local });
@@ -1316,7 +1405,13 @@ app.get('/control/:sl_uuid', (req, res) => {
         status.textContent = "Could not disconnect.";
       }
     };
-    loadToys();
+    loadToys().then(() => readBattery());
+    setInterval(() => {
+      fetch("/api/hud/status/" + encodeURIComponent(uuid))
+        .then((r) => r.json())
+        .then((data) => { if (data && data.toys) showToys(data.toys); })
+        .catch(() => {});
+    }, 20000);
   </script>
 </body>
 </html>`);
@@ -1342,7 +1437,7 @@ app.post('/api/webhook/lovense', async (req, res) => {
     }
 
     const userCheck = await db.query(
-      'SELECT sl_http_url, lovense_token, status, toys FROM active_sessions WHERE sl_uuid = $1',
+      'SELECT sl_http_url, lovense_token, status, toys, display_name FROM active_sessions WHERE sl_uuid = $1',
       [uid]
     );
 
@@ -1394,6 +1489,12 @@ app.post('/api/webhook/lovense', async (req, res) => {
         body: "CONNECTED|Successfully linked your Lovense toy!"
       });
     }
+
+    watchBattery({
+      sl_uuid: uid,
+      status: 'connected',
+      display_name: session.display_name
+    });
 
     res.sendStatus(200);
   } catch (err) {
