@@ -280,6 +280,7 @@ async function rememberBatteries(session, toys) {
 }
 
 async function toysForSession(session) {
+  watchBattery(session);
   let toys = listToys(session.connection);
   const cached = batteryCache.get(session.sl_uuid);
   if (cached && Date.now() - cached.at < 20000) {
@@ -303,6 +304,137 @@ async function toysForSession(session) {
     }
   }
   return toys;
+}
+
+const batteryWatchers = new Map();
+
+function stopBatteryWatch(uid) {
+  const watcher = batteryWatchers.get(uid);
+  if (!watcher) return;
+  watcher.stopped = true;
+  batteryWatchers.delete(uid);
+}
+
+function watchBattery(session) {
+  if (!session || session.status !== 'connected' || !LOVENSE_TOKEN) return;
+  const existing = batteryWatchers.get(session.sl_uuid);
+  if (existing && existing.retryAt > Date.now()) return;
+  if (existing && !existing.stopped) return;
+  const watcher = { stopped: false, retryAt: 0 };
+  batteryWatchers.set(session.sl_uuid, watcher);
+  readBatterySocket(session.sl_uuid, session.display_name, watcher).catch((err) => {
+    console.error('Battery watch failed:', err.message);
+  });
+}
+
+async function saveSocketBattery(uid, toyList) {
+  const incoming = (Array.isArray(toyList) ? toyList : []).map((toy) => ({
+    id: toy.id,
+    name: toy.nickname || toy.nickName || toy.name || toy.toyType,
+    battery: toyBattery(toy)
+  })).filter((toy) => toy.battery != null);
+  if (!incoming.length) return;
+  const session = await getSession(uid);
+  if (!session || session.status !== 'connected') return;
+  const toys = mergeBattery(listToys(session.connection), incoming);
+  batteryCache.set(uid, { at: Date.now(), toys });
+  await rememberBatteries(session, toys);
+  console.log('Lovense battery', toys.map((toy) => ({ name: toy.name, battery: toy.battery })));
+}
+
+function socketPackets(payload) {
+  return String(payload || '').split('\u001e').filter(Boolean);
+}
+
+async function readBatterySocket(uid, displayName, watcher) {
+  try {
+    const tokenRes = await fetch('https://api.lovense-api.com/api/basicApi/getToken', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        token: LOVENSE_TOKEN,
+        uid,
+        uname: displayName || uid
+      }),
+      signal: AbortSignal.timeout(8000)
+    });
+    const tokenData = await tokenRes.json();
+    const authToken = tokenData && tokenData.data && tokenData.data.authToken;
+    if (!authToken) {
+      console.error('Lovense socket token failed:', tokenData && tokenData.code, tokenData && tokenData.message);
+      return;
+    }
+
+    const urlRes = await fetch('https://api.lovense-api.com/api/basicApi/getSocketUrl', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ platform: PLATFORM_NAME, authToken }),
+      signal: AbortSignal.timeout(8000)
+    });
+    const urlData = await urlRes.json();
+    const socketIoUrl = urlData && urlData.data && urlData.data.socketIoUrl;
+    const socketIoPath = urlData && urlData.data && urlData.data.socketIoPath;
+    if (!socketIoUrl) {
+      console.error('Lovense socket url failed:', urlData && urlData.code, urlData && urlData.message);
+      return;
+    }
+
+    const base = `${String(socketIoUrl).replace(/\/$/, '')}${String(socketIoPath || '/socket.io').startsWith('/') ? '' : '/'}${socketIoPath || '/socket.io'}`;
+    const openRes = await fetch(`${base}/?EIO=4&transport=polling`, { signal: AbortSignal.timeout(8000) });
+    const openText = await openRes.text();
+    const openPacket = socketPackets(openText)[0] || openText;
+    const open = JSON.parse(openPacket.replace(/^\d/, ''));
+    const sid = open.sid;
+    const post = async (body) => {
+      await fetch(`${base}/?EIO=4&transport=polling&sid=${encodeURIComponent(sid)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+        body,
+        signal: AbortSignal.timeout(8000)
+      });
+    };
+    await post('40');
+    await post(`42${JSON.stringify(['basicapi_send_toy_command_ts', { command: 'GetToys', apiVer: 1 }])}`);
+
+    const deadline = Date.now() + 10 * 60 * 1000;
+    while (!watcher.stopped && Date.now() < deadline) {
+      const poll = await fetch(`${base}/?EIO=4&transport=polling&sid=${encodeURIComponent(sid)}`, {
+        signal: AbortSignal.timeout((open.pingInterval || 25000) + 5000)
+      });
+      const text = await poll.text();
+      for (const packet of socketPackets(text)) {
+        if (packet === '2' || packet.startsWith('2')) {
+          await post('3');
+          continue;
+        }
+        if (!packet.startsWith('42')) continue;
+        let eventName = '';
+        let data = null;
+        try {
+          const parsed = JSON.parse(packet.slice(2));
+          eventName = parsed[0];
+          data = parsed[1];
+          if (typeof data === 'string') {
+            try { data = JSON.parse(data); } catch (err) { /* keep string */ }
+          }
+        } catch (err) {
+          continue;
+        }
+        const toyList = data && (data.toyList || (data.data && data.data.toyList));
+        if (toyList) await saveSocketBattery(uid, toyList);
+        else {
+          const found = collectBatteries(data);
+          if (found.length) await saveSocketBattery(uid, found);
+          else if (eventName) console.log('Lovense socket event', eventName);
+        }
+      }
+    }
+  } finally {
+    if (batteryWatchers.get(uid) === watcher) {
+      watcher.stopped = true;
+      watcher.retryAt = Date.now() + 60000;
+    }
+  }
 }
 
 function preserveBattery(previousToys, incomingToys) {
@@ -444,7 +576,7 @@ function fadePosition(state) {
 }
 
 function cancelFade(uid) {
-  clearGlideQueue(uid);
+  stopFollower(uid);
   const state = fades.get(uid);
   if (state) state.gen += 1;
   fades.set(uid, { gen: (state?.gen || 0) + 1, at: 0, levels: null, started: 0 });
@@ -462,125 +594,101 @@ function functionCommand(action, seconds, toyId) {
   return command;
 }
 
-async function glideBySteps(uid, connection, toyId, levels, seconds, gen) {
-  const unique = [];
-  for (const level of levels) {
-    if (unique[unique.length - 1] !== level) unique.push(level);
+function patternSteps(from, to) {
+  const start = Math.max(0, Math.min(20, from | 0));
+  const end = Math.max(0, Math.min(20, to | 0));
+  const steps = [];
+  if (start === end) {
+    for (let i = 0; i < 15; i++) steps.push(end);
+    return steps;
   }
-  const started = Date.now();
-  let last = null;
-  for (const level of unique) {
-    const state = fades.get(uid);
-    if (!state || state.gen !== gen) return last;
-    const left = Math.max(1, Math.round(seconds - (Date.now() - started) / 1000));
-    last = await sendToyCommand(uid, connection, functionCommand(`Vibrate:${level}`, left, toyId));
-    if (!commandOk(last)) return last;
-    await new Promise((resolve) => setTimeout(resolve, 180));
+  const dir = end > start ? 1 : -1;
+  for (let value = start; dir > 0 ? value <= end : value >= end; value += dir) {
+    steps.push(value);
+    if (steps.length >= 40) break;
   }
-  return last;
+  steps[steps.length - 1] = end;
+  while (steps.length < 12) steps.push(end);
+  return steps.slice(0, 50);
 }
 
-async function playGlide(uid, connection, toyId, from, target, seconds) {
-  const previous = fades.get(uid);
-  const gen = (previous?.gen || 0) + 1;
-  const stepMs = 200;
-  if (target === from) {
-    fades.set(uid, { gen, at: target, target, levels: null, started: 0, stepMs });
-    return sendToyCommand(uid, connection, functionCommand(`Vibrate:${target}`, seconds, toyId));
-  }
+const followers = new Map();
 
-  const levels = glideStrengths(from, target);
-  const rampMs = Math.max(1200, levels.length * stepMs);
-  fades.set(uid, { gen, at: target, target, levels, started: Date.now(), stepMs });
+function stopFollower(uid) {
+  const state = followers.get(uid);
+  if (!state) return;
+  state.gen += 1;
+  if (state.timer) clearTimeout(state.timer);
+  followers.delete(uid);
+}
 
+async function sendPattern(uid, connection, toyId, steps) {
+  const timeSec = Number((steps.length * 0.1).toFixed(1));
   const pattern = {
     command: 'Pattern',
-    rule: 'V:1;F:v;S:200#',
-    strength: levels.join(';'),
-    timeSec: Math.max(1.2, rampMs / 1000),
-    apiVer: 2,
-    stopPrevious: 1
+    rule: 'V:1;F:v;S:100#',
+    strength: steps.join(';'),
+    timeSec,
+    apiVer: 2
   };
   if (toyId) pattern.toy = toyId;
-  let result = await sendToyCommand(uid, connection, pattern);
-  if (!commandOk(result)) {
-    console.error('Pattern glide rejected:', result && result.code, result && result.message);
-    delete pattern.stopPrevious;
-    result = await sendToyCommand(uid, connection, pattern);
-  }
-  if (!commandOk(result)) {
-    return glideBySteps(uid, connection, toyId, levels, seconds, gen);
-  }
-
-  const holdSec = Math.round(seconds - rampMs / 1000);
-  if (holdSec >= 1) {
-    setTimeout(() => {
-      const state = fades.get(uid);
-      if (!state || state.gen !== gen) return;
-      sendToyCommand(uid, connection, functionCommand(`Vibrate:${target}`, holdSec, toyId)).catch((err) => {
-        console.error('Smooth hold failed:', err.message);
-      });
-    }, rampMs);
-  }
-  return result;
+  return sendToyCommand(uid, connection, pattern);
 }
 
-const glideQueue = new Map();
-
-function clearGlideQueue(uid) {
-  const job = glideQueue.get(uid);
-  if (!job) return;
-  clearTimeout(job.timer);
-  glideQueue.delete(uid);
-  for (const resolve of job.waiters) resolve({ code: 200, result: true });
-}
-
-async function flushGlide(uid) {
-  const job = glideQueue.get(uid);
-  if (!job) return;
-  glideQueue.delete(uid);
+async function runFollow(uid) {
+  const state = followers.get(uid);
+  if (!state || state.busy) return;
+  if (Date.now() >= state.until || state.target === 0) return;
+  const gen = state.gen;
+  state.busy = true;
+  const steps = patternSteps(state.level, state.target);
+  const rampMs = steps.length * 100;
   try {
-    const result = await playGlide(uid, job.connection, job.toyId, job.from, job.target, job.seconds);
-    job.waiters.forEach((resolve) => resolve(result));
+    const result = await sendPattern(uid, state.connection, state.toyId, steps);
+    state.lastResult = result;
+    if (!commandOk(result)) {
+      console.error('Slider pattern rejected:', result && result.code, result && result.message);
+      state.lastResult = result;
+      state.playUntil = Date.now() + 2000;
+      return;
+    }
+    if (!followers.get(uid) || state.gen !== gen) return;
+    state.level = steps[steps.length - 1];
+    state.playUntil = Date.now() + rampMs;
   } catch (err) {
-    job.waiters.forEach((resolve) => resolve({ code: 500, message: err.message }));
+    console.error('Slider pattern failed:', err.message);
+    state.lastResult = { code: 500, message: err.message };
+  } finally {
+    state.busy = false;
+    if (followers.get(uid) && state.gen === gen && Date.now() < state.until && state.target !== 0) {
+      const wait = Math.max(40, (state.playUntil || 0) - Date.now() - 350);
+      state.timer = setTimeout(() => runFollow(uid), wait);
+    }
   }
 }
 
 async function sendSmoothLevel(uid, connection, toyId, target, seconds) {
   if (target === 0) {
-    clearGlideQueue(uid);
-    const previous = fades.get(uid);
-    const gen = (previous?.gen || 0) + 1;
-    fades.set(uid, { gen, at: 0, target: 0, levels: null, started: 0, stepMs: 200 });
+    stopFollower(uid);
     return sendToyCommand(uid, connection, functionCommand('Stop', 0, toyId));
   }
 
-  const existing = glideQueue.get(uid);
-  if (existing) {
-    existing.target = target;
-    existing.seconds = seconds;
-    existing.toyId = toyId;
-    existing.connection = connection;
-    clearTimeout(existing.timer);
-    return new Promise((resolve) => {
-      existing.waiters.push(resolve);
-      existing.timer = setTimeout(() => flushGlide(uid), 280);
-    });
+  let state = followers.get(uid);
+  if (!state) {
+    state = { gen: 1, level: 0, target: 0, until: 0, busy: false, timer: null, playUntil: 0, lastResult: null };
+    followers.set(uid, state);
   }
+  state.connection = connection;
+  state.toyId = toyId || state.toyId;
+  state.target = target;
+  state.until = Date.now() + Math.max(1, seconds) * 1000;
 
-  return new Promise((resolve) => {
-    const job = {
-      from: fadePosition(fades.get(uid)),
-      target,
-      seconds,
-      toyId,
-      connection,
-      waiters: [resolve],
-      timer: setTimeout(() => flushGlide(uid), 280)
-    };
-    glideQueue.set(uid, job);
-  });
+  const patternRunning = state.playUntil && state.playUntil - Date.now() > 500;
+  if (state.busy || patternRunning) {
+    return { code: 200, result: true };
+  }
+  await runFollow(uid);
+  return state.lastResult || { code: 200, result: true };
 }
 
 async function getSession(slUuid) {
@@ -906,7 +1014,7 @@ app.get('/control/:sl_uuid', (req, res) => {
 </head>
 <body>
   <h1>Toy controls</h1>
-  <p>Drag the slider from 0 to 100. The toy eases through its 20 power steps, then holds until the seconds run out.</p>
+  <p>Drag the slider from 0 to 100. The toy follows in one continuous pattern and does not stop between moves.</p>
   <label for="toy">Toy</label>
   <select id="toy"><option value="">All connected toys</option></select>
   <label for="strength">Vibration 0–100: <span id="strengthVal">0</span></label>
@@ -952,33 +1060,25 @@ app.get('/control/:sl_uuid', (req, res) => {
     }
 
     function queueSend() {
-      if (sendTimer) clearTimeout(sendTimer);
+      if (sendTimer) return;
       sendTimer = setTimeout(() => {
         sendTimer = null;
-        pump();
-      }, 320);
-    }
-
-    async function pump() {
-      if (inflight) return;
-      const level = desired;
-      const left = level === 0 ? 0 : remaining();
-      if (level > 0 && left <= 0) return;
-      if (!resend && toyStep(level) === toyStep(lastSent) && (level === 0) === (lastSent === 0)) return;
-      resend = false;
-      inflight = true;
-      try {
-        await postCommand(commandBody(level, left));
-        lastSent = level;
-        status.textContent = level === 0
-          ? "Stopped."
-          : ("Strength " + level + " of 100, step " + toyStep(level) + " of 20, " + left + "s left");
-      } catch (e) {
-        status.textContent = e.message || "Command failed.";
-      } finally {
-        inflight = false;
-        if (toyStep(desired) !== toyStep(lastSent) || (desired === 0) !== (lastSent === 0)) queueSend();
-      }
+        const level = desired;
+        const left = level === 0 ? 0 : remaining();
+        if (level > 0 && left <= 0) {
+          if (desired !== level) queueSend();
+          return;
+        }
+        postCommand(commandBody(level, left)).then(() => {
+          lastSent = level;
+          status.textContent = level === 0
+            ? "Stopped."
+            : ("Strength " + level + " of 100, step " + toyStep(level) + " of 20");
+        }).catch((e) => {
+          status.textContent = e.message || "Command failed.";
+        });
+        if (desired !== level) queueSend();
+      }, 80);
     }
 
     strength.oninput = () => {
@@ -987,7 +1087,7 @@ app.get('/control/:sl_uuid', (req, res) => {
       desired = level;
       if (level > 0) beginSession();
       else stopClock();
-      queueSend();
+        queueSend();
     };
 
     function stopClock() {
@@ -1007,7 +1107,7 @@ app.get('/control/:sl_uuid', (req, res) => {
         strengthVal.textContent = "0";
         desired = 0;
         status.textContent = "Time is up.";
-        pump();
+        queueSend();
       }, 250);
     }
 
@@ -1127,14 +1227,14 @@ app.get('/control/:sl_uuid', (req, res) => {
       desired = level;
       resend = true;
       beginSession();
-      pump();
+      queueSend();
     };
     document.getElementById("stop").onclick = () => {
       stopClock();
       strength.value = "0";
       strengthVal.textContent = "0";
       desired = 0;
-      pump();
+      queueSend();
     };
     document.getElementById("disconnect").onclick = async () => {
       stopClock();
@@ -1256,6 +1356,7 @@ app.post('/api/hud/disconnect', async (req, res) => {
       return res.status(404).json({ error: "No link to disconnect." });
     }
 
+    stopBatteryWatch(slUuid);
     if (session.status === 'connected' && session.connection) {
       cancelFade(slUuid);
       try {
