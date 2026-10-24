@@ -879,8 +879,8 @@ app.post('/api/hud/register', async (req, res) => {
 
   try {
     await db.query(
-      `INSERT INTO active_sessions (sl_uuid, sl_http_url, status, lovense_token, display_name, shared)
-       VALUES ($1, $2, 'pending', $3, $4, false)
+      `INSERT INTO active_sessions (sl_uuid, sl_http_url, status, lovense_token, display_name, shared, vibe_until)
+       VALUES ($1, $2, 'pending', $3, $4, false, NOW())
        ON CONFLICT (sl_uuid) DO UPDATE SET
          sl_http_url = $2,
          status = 'pending',
@@ -1003,18 +1003,35 @@ app.get('/pair/:sl_uuid', (req, res) => {
 <body>
   <h1>Scan with Lovense Remote</h1>
   <p>Open Lovense Remote, use Scan QR, then wait until this page says connected.</p>
-  <img id="qr" src="${qrSrc}" alt="Lovense QR code" onerror="this.onerror=null;this.src='${fallbackSrc}'">
+  <img id="qr" src="${qrSrc}" alt="Lovense QR code">
   <p id="status">Waiting for scan…</p>
   <script>
+    const statusEl = document.getElementById("status");
+    const qr = document.getElementById("qr");
+    const started = Date.now();
+    qr.onerror = () => {
+      if (!qr.dataset.fallback) {
+        qr.dataset.fallback = "1";
+        qr.src = ${JSON.stringify(fallbackSrc)};
+        return;
+      }
+      statusEl.textContent = "This code expired. Touch Link toy in Second Life and scan the new one.";
+    };
     async function poll() {
       try {
         const r = await fetch(${JSON.stringify(statusUrl)});
         const data = await r.json();
         if (data.status === "connected") {
-          document.getElementById("status").innerHTML = 'Connected! <a href="${controlUrl}">Open toy controls</a>';
+          statusEl.innerHTML = 'Connected! <a href="${controlUrl}">Open toy controls</a>';
           return;
         }
-      } catch (e) {}
+        const waited = Date.now() - started;
+        statusEl.textContent = waited < 20000
+          ? "Waiting for scan…"
+          : "Still waiting. In Lovense Remote, open Scan and point it at this code.";
+      } catch (e) {
+        statusEl.textContent = "The page can't reach the server. Touch Link toy again.";
+      }
       setTimeout(poll, 2000);
     }
     poll();
@@ -1417,11 +1434,33 @@ app.get('/control/:sl_uuid', (req, res) => {
 </html>`);
 });
 
+async function newestPendingUid() {
+  const pending = await db.query(
+    `SELECT sl_uuid FROM active_sessions
+     WHERE status = 'pending'
+       AND vibe_until > NOW() - INTERVAL '4 hours'
+     ORDER BY vibe_until DESC
+     LIMIT 1`
+  );
+  return pending.rows[0] && pending.rows[0].sl_uuid;
+}
+
 app.post('/api/webhook/lovense', async (req, res) => {
-  const body = req.body || {};
-  let uid = body.uid || body.userId || body.uuid;
-  const utoken = body.utoken;
-  const { domain, httpPort, httpsPort, wsPort, wssPort, platform, appType } = body;
+  let body = req.body || {};
+  if (typeof body === 'string') {
+    try { body = JSON.parse(body); } catch (err) { body = {}; }
+  }
+  const nested = body.data && typeof body.data === 'object' ? body.data : {};
+  let uid = body.uid || body.userId || body.uuid || body.user_id || nested.uid || nested.userId || nested.uuid;
+  const utoken = body.utoken || nested.utoken;
+  const domain = body.domain || nested.domain;
+  const httpPort = body.httpPort || nested.httpPort;
+  const httpsPort = body.httpsPort || nested.httpsPort;
+  const wsPort = body.wsPort || nested.wsPort;
+  const wssPort = body.wssPort || nested.wssPort;
+  const platform = body.platform || nested.platform;
+  const appType = body.appType || nested.appType;
+  if (!body.toyList && nested.toyList) body = { ...nested, ...body };
 
   try {
     if (!uid && utoken) {
@@ -1430,6 +1469,10 @@ app.post('/api/webhook/lovense', async (req, res) => {
         [utoken]
       );
       uid = byToken.rows[0] && byToken.rows[0].sl_uuid;
+    }
+    if (!uid && (body.toyList || body.deviceCode || body.domain)) {
+      uid = await newestPendingUid();
+      if (uid) console.log('Lovense callback matched the open scan', uid);
     }
     if (!uid) {
       console.error('Lovense callback missing uid', Object.keys(body));
@@ -1441,11 +1484,24 @@ app.post('/api/webhook/lovense', async (req, res) => {
       [uid]
     );
 
-    if (userCheck.rows.length === 0) {
+    let session = userCheck.rows[0];
+    if (!session) {
+      const pending = await newestPendingUid();
+      if (pending && pending !== uid) {
+        const retry = await db.query(
+          'SELECT sl_http_url, lovense_token, status, toys, display_name FROM active_sessions WHERE sl_uuid = $1',
+          [pending]
+        );
+        session = retry.rows[0];
+        if (session) {
+          console.log('Lovense callback matched the open scan', pending);
+          uid = pending;
+        }
+      }
+    }
+    if (!session) {
       return res.status(404).send("User session not found in database.");
     }
-
-    const session = userCheck.rows[0];
     if (session.status === 'disconnected') {
       return res.sendStatus(200);
     }
