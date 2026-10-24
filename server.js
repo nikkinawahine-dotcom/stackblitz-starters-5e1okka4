@@ -241,7 +241,7 @@ async function toysForSession(session) {
   let toys = listToys(session.connection);
   const cached = batteryCache.get(session.sl_uuid);
   if (cached && Date.now() - cached.at < 20000) {
-    toys = mergeBattery(toys, cached.toys);
+    return mergeBattery(toys, cached.toys);
   }
   if (toys.some((toy) => toy.battery == null)) {
     try {
@@ -252,22 +252,8 @@ async function toysForSession(session) {
       console.error('GetToys for titler failed:', err.message);
     }
   }
-  for (const toy of toys) {
-    if (toy.battery != null || !toy.id) continue;
-    try {
-      const batt = await sendLovenseCommand(session.sl_uuid, {
-        command: 'GetBattery',
-        toy: toy.id,
-        apiVer: 1
-      });
-      const value = batteryFromCommand(batt);
-      if (value != null) toy.battery = value;
-    } catch (err) {
-      console.error('GetBattery failed:', err.message);
-    }
-  }
+  batteryCache.set(session.sl_uuid, { at: Date.now(), toys });
   if (toys.some((toy) => toy.battery != null)) {
-    batteryCache.set(session.sl_uuid, { at: Date.now(), toys });
     try {
       await rememberBatteries(session, toys);
     } catch (err) {
@@ -275,6 +261,33 @@ async function toysForSession(session) {
     }
   }
   return toys;
+}
+
+function preserveBattery(previousToys, incomingToys) {
+  let prev = previousToys;
+  let next = incomingToys;
+  if (typeof prev === 'string') {
+    try { prev = JSON.parse(prev); } catch (err) { prev = null; }
+  }
+  if (typeof next === 'string') {
+    try { next = JSON.parse(next); } catch (err) { next = null; }
+  }
+  if (!next || typeof next !== 'object') return incomingToys;
+  if (!prev || typeof prev !== 'object') return next;
+  const copy = { ...next };
+  for (const [id, toy] of Object.entries(copy)) {
+    if (!toy || typeof toy !== 'object') continue;
+    const old = prev[id] || Object.values(prev).find((item) => item && item.id === (toy.id || id));
+    if (old && toyBattery(toy) == null && toyBattery(old) != null) {
+      copy[id] = { ...toy, battery: toyBattery(old) };
+    }
+  }
+  return copy;
+}
+
+function localCommandUrl(connection) {
+  if (!connection || !connection.domain || !connection.httpsPort) return null;
+  return `https://${connection.domain}:${connection.httpsPort}/command`;
 }
 
 function commandOk(data) {
@@ -323,7 +336,8 @@ async function sendLovenseCommand(uid, payload) {
       token: LOVENSE_TOKEN,
       uid,
       ...payload
-    })
+    }),
+    signal: AbortSignal.timeout(4000)
   });
   const text = await response.text();
   try {
@@ -356,16 +370,29 @@ async function sendToyCommand(uid, connection, payload) {
 
 const fades = new Map();
 
-function sampleRamp(from, to, maxSteps) {
-  const diff = to - from;
-  if (diff === 0) return [to];
-  const steps = Math.min(Math.abs(diff), maxSteps);
-  const levels = [];
-  for (let i = 1; i <= steps; i++) {
-    levels.push(Math.round(from + (diff * i) / steps));
+function percentToLevel(percent) {
+  const p = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
+  if (p <= 0) return 0;
+  return Math.max(1, Math.round((p * 20) / 100));
+}
+
+function glideStrengths(from, to) {
+  const start = Math.max(0, Math.min(20, from | 0));
+  const end = Math.max(0, Math.min(20, to | 0));
+  if (start === end) return [end];
+  const dir = end > start ? 1 : -1;
+  const span = [];
+  for (let value = start + dir; dir > 0 ? value <= end : value >= end; value += dir) {
+    span.push(value);
   }
-  levels[levels.length - 1] = to;
-  return levels;
+  const repeats = Math.max(1, Math.min(3, Math.floor(50 / span.length)));
+  const eased = [];
+  for (const value of span) {
+    for (let n = 0; n < repeats && eased.length < 50; n++) eased.push(value);
+  }
+  while (eased.length < 12 && eased.length < 50) eased.push(end);
+  if (eased[eased.length - 1] !== end) eased.push(end);
+  return eased.slice(0, 50);
 }
 
 function fadePosition(state) {
@@ -381,74 +408,82 @@ function cancelFade(uid) {
   fades.set(uid, { gen: (state?.gen || 0) + 1, at: 0, levels: null, started: 0 });
 }
 
+function functionCommand(action, seconds, toyId) {
+  const command = {
+    command: 'Function',
+    action,
+    timeSec: action === 'Stop' ? 0 : Math.max(1, seconds),
+    apiVer: 1,
+    stopPrevious: 1
+  };
+  if (toyId && action !== 'Stop') command.toy = toyId;
+  return command;
+}
+
+async function glideBySteps(uid, connection, toyId, levels, seconds, gen) {
+  const unique = [];
+  for (const level of levels) {
+    if (unique[unique.length - 1] !== level) unique.push(level);
+  }
+  const started = Date.now();
+  let last = null;
+  for (const level of unique) {
+    const state = fades.get(uid);
+    if (!state || state.gen !== gen) return last;
+    const left = Math.max(1, Math.round(seconds - (Date.now() - started) / 1000));
+    last = await sendToyCommand(uid, connection, functionCommand(`Vibrate:${level}`, left, toyId));
+    await new Promise((resolve) => setTimeout(resolve, 160));
+  }
+  return last;
+}
+
 async function sendSmoothLevel(uid, connection, toyId, target, seconds) {
   const previous = fades.get(uid);
   const from = fadePosition(previous);
   const gen = (previous?.gen || 0) + 1;
+  if (target === 0) {
+    fades.set(uid, { gen, at: 0, target: 0, levels: null, started: 0 });
+    return sendToyCommand(uid, connection, functionCommand('Stop', 0, toyId));
+  }
+
+  const stillGliding = previous
+    && previous.target === target
+    && previous.levels
+    && previous.started
+    && (Date.now() - previous.started) < previous.levels.length * 85;
+  if (stillGliding) {
+    return { code: 200, result: true };
+  }
+
   if (target === from) {
-    fades.set(uid, { gen, at: target, levels: null, started: 0 });
-    const hold = {
-      command: 'Function',
-      action: target === 0 ? 'Stop' : `Vibrate:${target}`,
-      timeSec: target === 0 ? 0 : Math.max(1, seconds),
-      apiVer: 1,
-      stopPrevious: 1
-    };
-    if (toyId && target !== 0) hold.toy = toyId;
-    return sendToyCommand(uid, connection, hold);
+    fades.set(uid, { gen, at: target, target, levels: null, started: 0 });
+    return sendToyCommand(uid, connection, functionCommand(`Vibrate:${target}`, seconds, toyId));
   }
 
-  const maxSteps = Math.max(1, Math.min(20, Math.floor(Math.max(1, seconds) * 10) - 1));
-  const levels = sampleRamp(from, target, maxSteps);
+  const levels = glideStrengths(from, target);
   const rampMs = levels.length * 100;
-  fades.set(uid, { gen, at: target, levels, started: Date.now() });
-
-  if (target === 0 && levels.length < 3) {
-    return sendToyCommand(uid, connection, {
-      command: 'Function',
-      action: 'Stop',
-      timeSec: 0,
-      apiVer: 1,
-      stopPrevious: 1
-    });
-  }
+  fades.set(uid, { gen, at: target, target, levels, started: Date.now() });
 
   const pattern = {
     command: 'Pattern',
     rule: 'V:1;F:v;S:100#',
     strength: levels.join(';'),
-    timeSec: Math.max(1, rampMs / 1000),
-    apiVer: 2,
-    stopPrevious: 1
+    timeSec: Math.max(1.2, rampMs / 1000),
+    apiVer: 2
   };
   if (toyId) pattern.toy = toyId;
   const result = await sendToyCommand(uid, connection, pattern);
   if (!commandOk(result)) {
-    const direct = {
-      command: 'Function',
-      action: `Vibrate:${target}`,
-      timeSec: Math.max(1, seconds),
-      apiVer: 1,
-      stopPrevious: 1
-    };
-    if (toyId) direct.toy = toyId;
-    return sendToyCommand(uid, connection, direct);
+    console.error('Pattern glide rejected:', result && result.code, result && result.message);
+    return glideBySteps(uid, connection, toyId, levels, seconds, gen);
   }
 
   const holdSec = Math.round(seconds - rampMs / 1000);
-  if (target > 0 && holdSec >= 1) {
+  if (holdSec >= 1) {
     setTimeout(() => {
       const state = fades.get(uid);
       if (!state || state.gen !== gen) return;
-      const hold = {
-        command: 'Function',
-        action: `Vibrate:${target}`,
-        timeSec: holdSec,
-        apiVer: 1,
-        stopPrevious: 1
-      };
-      if (toyId) hold.toy = toyId;
-      sendToyCommand(uid, connection, hold).catch((err) => {
+      sendToyCommand(uid, connection, functionCommand(`Vibrate:${target}`, holdSec, toyId)).catch((err) => {
         console.error('Smooth hold failed:', err.message);
       });
     }, rampMs);
@@ -730,9 +765,13 @@ app.get('/api/hud/toys/:sl_uuid', async (req, res) => {
       return res.status(404).json({ error: "Toy is not connected." });
     }
 
-    const toys = listToys(session.connection);
+    const toys = mergeBattery(
+      listToys(session.connection),
+      (batteryCache.get(session.sl_uuid) || {}).toys || []
+    );
+    const local = localCommandUrl(session.connection);
 
-    return res.json({ toys });
+    return res.json({ toys, local_command: local });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Toy list lookup failed." });
@@ -758,16 +797,17 @@ app.get('/control/:sl_uuid', (req, res) => {
 </head>
 <body>
   <h1>Toy controls</h1>
-  <p>Drag the slider. Strength eases as you move it, then stops when the seconds run out. Keep Lovense Remote open.</p>
+  <p>Drag the slider from 0 to 100. The toy eases through its 20 power steps, then holds until the seconds run out.</p>
   <label for="toy">Toy</label>
   <select id="toy"><option value="">All connected toys</option></select>
-  <label for="strength">Vibration 0–20: <span id="strengthVal">0</span></label>
-  <input id="strength" type="range" min="0" max="20" step="1" value="0">
+  <label for="strength">Vibration 0–100: <span id="strengthVal">0</span></label>
+  <input id="strength" type="range" min="0" max="100" step="1" value="0">
   <label for="duration">Seconds</label>
   <input id="duration" type="number" min="1" max="60" value="5">
   <button id="vibrate">Vibrate for those seconds</button>
     <button id="stop" class="secondary">Stop</button>
     <button id="disconnect" class="secondary">Disconnect</button>
+  <p id="battery"></p>
   <p id="status">Loading toys…</p>
   <script>
     const uuid = ${JSON.stringify(slUuid)};
@@ -776,6 +816,7 @@ app.get('/control/:sl_uuid', (req, res) => {
     const strengthVal = document.getElementById("strengthVal");
     const duration = document.getElementById("duration");
     const status = document.getElementById("status");
+    const batteryLine = document.getElementById("battery");
     let desired = 0;
     let lastSent = -1;
     let inflight = false;
@@ -783,6 +824,13 @@ app.get('/control/:sl_uuid', (req, res) => {
     let endsAt = 0;
     let clock = null;
     let sendTimer = null;
+    let localCommand = "";
+
+    function toyStep(percent) {
+      const p = Math.max(0, Math.min(100, percent));
+      if (p <= 0) return 0;
+      return Math.max(1, Math.round((p * 20) / 100));
+    }
 
     function allowedSeconds() {
       const n = parseInt(duration.value, 10) || 5;
@@ -795,11 +843,11 @@ app.get('/control/:sl_uuid', (req, res) => {
     }
 
     function queueSend() {
-      if (sendTimer) return;
+      if (sendTimer) clearTimeout(sendTimer);
       sendTimer = setTimeout(() => {
         sendTimer = null;
         pump();
-      }, 90);
+      }, 180);
     }
 
     async function pump() {
@@ -807,18 +855,20 @@ app.get('/control/:sl_uuid', (req, res) => {
       const level = desired;
       const left = level === 0 ? 0 : remaining();
       if (level > 0 && left <= 0) return;
-      if (level === lastSent && !resend) return;
+      if (!resend && toyStep(level) === toyStep(lastSent) && (level === 0) === (lastSent === 0)) return;
       resend = false;
       inflight = true;
       try {
         await postCommand(commandBody(level, left));
         lastSent = level;
-        status.textContent = level === 0 ? "Stopped." : ("Strength " + level + ", " + left + "s left");
+        status.textContent = level === 0
+          ? "Stopped."
+          : ("Strength " + level + " of 100, step " + toyStep(level) + " of 20, " + left + "s left");
       } catch (e) {
         status.textContent = e.message || "Command failed.";
       } finally {
         inflight = false;
-        if (desired !== lastSent) queueSend();
+        if (toyStep(desired) !== toyStep(lastSent) || (desired === 0) !== (lastSent === 0)) queueSend();
       }
     }
 
@@ -875,6 +925,71 @@ app.get('/control/:sl_uuid', (req, res) => {
       };
     }
 
+    function toyLabel(toy) {
+      const name = toy.name + " (" + toy.type + ")";
+      return toy.battery == null ? name : (name + "  " + toy.battery + "%");
+    }
+
+    function showToys(toys) {
+      const selected = toySelect.value;
+      toySelect.innerHTML = '<option value="">All connected toys</option>';
+      (toys || []).forEach((toy) => {
+        const opt = document.createElement("option");
+        opt.value = toy.id;
+        opt.textContent = toyLabel(toy);
+        toySelect.appendChild(opt);
+      });
+      if (selected) toySelect.value = selected;
+      const withBattery = (toys || []).filter((toy) => toy.battery != null);
+      batteryLine.textContent = withBattery.length
+        ? withBattery.map((toy) => toy.name + "  " + toy.battery + "%").join(" | ")
+        : "";
+    }
+
+    function parseLocalToys(data) {
+      let payload = data && data.data && data.data.toys ? data.data.toys : (data && data.toys);
+      if (!payload) return [];
+      if (typeof payload === "string") {
+        try { payload = JSON.parse(payload); } catch (e) { return []; }
+      }
+      return Object.values(payload).map((toy) => {
+        const raw = toy.battery != null ? toy.battery : toy.batt;
+        const n = parseInt(raw, 10);
+        return {
+          id: toy.id,
+          name: toy.nickName || toy.name || toy.id,
+          type: toy.name || "toy",
+          battery: Number.isNaN(n) ? null : Math.max(0, Math.min(100, n))
+        };
+      }).filter((toy) => toy.battery != null);
+    }
+
+    async function readBattery() {
+      const urls = [];
+      if (localCommand) urls.push(localCommand);
+      urls.push("https://127-0-0-1.lovense.club:30010/command");
+      for (const url of urls) {
+        try {
+          const r = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-platform": "HotHawaiianNights" },
+            body: JSON.stringify({ command: "GetToys" })
+          });
+          const data = await r.json();
+          const toys = parseLocalToys(data);
+          if (!toys.length) continue;
+          const saved = await fetch("/api/hud/battery", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ wearer_uuid: uuid, toys })
+          });
+          const body = await saved.json();
+          if (body && body.toys) showToys(body.toys);
+          return;
+        } catch (e) {}
+      }
+    }
+
     async function loadToys() {
       try {
         const r = await fetch("/api/hud/toys/" + encodeURIComponent(uuid));
@@ -883,16 +998,12 @@ app.get('/control/:sl_uuid', (req, res) => {
           status.textContent = data.error || "Could not load toys.";
           return;
         }
-        toySelect.innerHTML = '<option value="">All connected toys</option>';
-        (data.toys || []).forEach((toy) => {
-          const opt = document.createElement("option");
-          opt.value = toy.id;
-          opt.textContent = toy.name + " (" + toy.type + ")";
-          toySelect.appendChild(opt);
-        });
+        localCommand = data.local_command || "";
+        showToys(data.toys);
         status.textContent = (data.toys && data.toys.length)
-          ? "Drag the slider. It runs for the seconds shown, then stops."
-          : "No toys reported yet. Keep Remote open and refresh.";
+          ? "Drag the slider from 0 to 100. It eases through the toy's 20 steps."
+          : "No toys reported yet. Keep Lovense Connect open and refresh.";
+        readBattery();
       } catch (e) {
         status.textContent = "Failed to load toys.";
       }
@@ -940,6 +1051,7 @@ app.get('/control/:sl_uuid', (req, res) => {
       }
     };
     loadToys();
+    setInterval(readBattery, 15000);
   </script>
 </body>
 </html>`);
@@ -950,7 +1062,7 @@ app.post('/api/webhook/lovense', async (req, res) => {
 
   try {
     const userCheck = await db.query(
-      'SELECT sl_http_url, lovense_token, status FROM active_sessions WHERE sl_uuid = $1',
+      'SELECT sl_http_url, lovense_token, status, toys FROM active_sessions WHERE sl_uuid = $1',
       [uid]
     );
 
@@ -966,7 +1078,17 @@ app.post('/api/webhook/lovense', async (req, res) => {
       return res.status(403).send("utoken mismatch.");
     }
 
-    const connection = { toys, domain, httpPort, httpsPort, wsPort, wssPort, platform, appType };
+    const previous = parseConnection(session.toys);
+    const mergedToys = preserveBattery(previous && previous.toys, toys);
+    const connection = { toys: mergedToys, domain, httpPort, httpsPort, wsPort, wssPort, platform, appType };
+    const reported = listToys(connection).map((toy) => ({
+      name: toy.name,
+      battery: toy.battery
+    }));
+    console.log('Lovense link update', { platform, appType, domain, toys: reported });
+    if (reported.some((toy) => toy.battery != null)) {
+      batteryCache.set(uid, { at: Date.now(), toys: listToys(connection) });
+    }
 
     await db.query(
       `UPDATE active_sessions
@@ -1046,6 +1168,35 @@ app.post('/api/hud/disconnect', async (req, res) => {
   }
 });
 
+app.post('/api/hud/battery', async (req, res) => {
+  const slUuid = req.body.sl_uuid || req.body.wearer_uuid;
+  const reported = Array.isArray(req.body.toys) ? req.body.toys : [];
+  if (!slUuid) {
+    return res.status(400).json({ error: "Missing wearer_uuid." });
+  }
+  try {
+    const session = await getSession(slUuid);
+    if (!session || session.status !== 'connected') {
+      return res.status(404).json({ error: "Toy is not connected." });
+    }
+    const incoming = reported.map((toy) => ({
+      id: toy.id,
+      name: toy.name || toy.nickName,
+      battery: toyBattery(toy)
+    })).filter((toy) => toy.battery != null);
+    if (!incoming.length) {
+      return res.json({ success: false });
+    }
+    const toys = mergeBattery(listToys(session.connection), incoming);
+    batteryCache.set(slUuid, { at: Date.now(), toys });
+    await rememberBatteries(session, toys);
+    return res.json({ success: true, toy_line: toyLine(toys), toys });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not save battery." });
+  }
+});
+
 app.post('/api/hud/vibrate', async (req, res) => {
   const { wearer_uuid, strength, duration, toy_id, stop } = req.body;
 
@@ -1059,13 +1210,14 @@ app.post('/api/hud/vibrate', async (req, res) => {
       return res.status(404).json({ error: "Toy is not connected or session expired. Re-link the QR." });
     }
 
-    let level = parseInt(strength, 10);
-    if (Number.isNaN(level)) level = 0;
-    level = Math.max(0, Math.min(20, level));
+    let percent = parseInt(strength, 10);
+    if (Number.isNaN(percent)) percent = 0;
+    percent = Math.max(0, Math.min(100, percent));
+    const level = percentToLevel(percent);
     let seconds = parseInt(duration, 10);
     if (Number.isNaN(seconds)) seconds = 0;
     seconds = Math.max(0, Math.min(60, seconds));
-    const stopNow = stop === true || stop === 'true' || level === 0;
+    const stopNow = stop === true || stop === 'true' || percent === 0;
 
     let commandData;
     if (stopNow) {
