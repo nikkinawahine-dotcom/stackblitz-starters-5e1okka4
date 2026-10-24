@@ -542,14 +542,14 @@ app.get('/control/:sl_uuid', (req, res) => {
 </head>
 <body>
   <h1>Toy controls</h1>
-  <p>This controls the linked avatar's toy. <a href="/control" style="color:#ff7ad9">Choose a partner</a></p>
+  <p>Drag the slider. Strength changes while you move it. Keep Lovense Remote open.</p>
   <label for="toy">Toy</label>
   <select id="toy"><option value="">All connected toys</option></select>
-  <label for="strength">Vibration 0–20: <span id="strengthVal">10</span></label>
-  <input id="strength" type="range" min="0" max="20" value="10">
-  <label for="duration">Seconds</label>
+  <label for="strength">Vibration 0–20: <span id="strengthVal">0</span></label>
+  <input id="strength" type="range" min="0" max="20" step="1" value="0">
+  <label for="duration">Timed burst, seconds</label>
   <input id="duration" type="number" min="1" max="60" value="5">
-  <button id="vibrate">Vibrate</button>
+  <button id="vibrate">Vibrate for those seconds</button>
   <button id="stop" class="secondary">Stop</button>
   <p id="status">Loading toys…</p>
   <script>
@@ -559,7 +559,56 @@ app.get('/control/:sl_uuid', (req, res) => {
     const strengthVal = document.getElementById("strengthVal");
     const duration = document.getElementById("duration");
     const status = document.getElementById("status");
-    strength.oninput = () => strengthVal.textContent = strength.value;
+    let desired = null;
+    let lastSent = null;
+    let inflight = false;
+
+    async function postCommand(body) {
+      const r = await fetch("/api/hud/vibrate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const data = await r.json();
+      if (!r.ok || data.error) {
+        throw new Error(data.error || "Command failed.");
+      }
+      return data;
+    }
+
+    function commandBody(level, seconds) {
+      return {
+        wearer_uuid: uuid,
+        strength: level,
+        duration: seconds,
+        stop: level === 0,
+        toy_id: toySelect.value || undefined
+      };
+    }
+
+    async function pump() {
+      if (inflight || desired === null || desired === lastSent) return;
+      const level = desired;
+      inflight = true;
+      try {
+        await postCommand(commandBody(level, 0));
+        lastSent = level;
+        status.textContent = level === 0 ? "Stopped." : ("Strength " + level);
+      } catch (e) {
+        status.textContent = e.message || "Command failed.";
+        lastSent = level;
+      } finally {
+        inflight = false;
+        if (desired !== lastSent) pump();
+      }
+    }
+
+    strength.oninput = () => {
+      const level = parseInt(strength.value, 10) || 0;
+      strengthVal.textContent = String(level);
+      desired = level;
+      pump();
+    };
 
     async function loadToys() {
       try {
@@ -577,31 +626,35 @@ app.get('/control/:sl_uuid', (req, res) => {
           toySelect.appendChild(opt);
         });
         status.textContent = (data.toys && data.toys.length)
-          ? "Select a toy, then vibrate."
+          ? "Drag the slider to change strength."
           : "No toys reported yet. Keep Remote open and refresh.";
       } catch (e) {
         status.textContent = "Failed to load toys.";
       }
     }
 
-    async function sendCommand(extra) {
-      const body = Object.assign({
-        wearer_uuid: uuid,
-        strength: parseInt(strength.value, 10),
-        duration: parseInt(duration.value, 10) || 5,
-        toy_id: toySelect.value || undefined
-      }, extra);
-      const r = await fetch("/api/hud/vibrate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body)
-      });
-      const data = await r.json();
-      status.textContent = data.error || (data.success ? "Command sent." : "Command failed.");
-    }
-
-    document.getElementById("vibrate").onclick = () => sendCommand({});
-    document.getElementById("stop").onclick = () => sendCommand({ stop: true });
+    document.getElementById("vibrate").onclick = async () => {
+      const level = parseInt(strength.value, 10) || 0;
+      const seconds = parseInt(duration.value, 10) || 5;
+      if (level === 0) {
+        status.textContent = "Move the slider above 0 first.";
+        return;
+      }
+      try {
+        await postCommand(commandBody(level, seconds));
+        lastSent = level;
+        desired = level;
+        status.textContent = "Strength " + level + " for " + seconds + " seconds.";
+      } catch (e) {
+        status.textContent = e.message || "Command failed.";
+      }
+    };
+    document.getElementById("stop").onclick = () => {
+      strength.value = "0";
+      strengthVal.textContent = "0";
+      desired = 0;
+      pump();
+    };
     loadToys();
   </script>
 </body>
@@ -663,12 +716,20 @@ app.post('/api/hud/vibrate', async (req, res) => {
       return res.status(404).json({ error: "Toy is not connected or session expired. Re-link the QR." });
     }
 
-    const payload = stop
+    let level = parseInt(strength, 10);
+    if (Number.isNaN(level)) level = 0;
+    level = Math.max(0, Math.min(20, level));
+    let seconds = parseInt(duration, 10);
+    if (Number.isNaN(seconds)) seconds = 0;
+    seconds = Math.max(0, Math.min(60, seconds));
+    const stopNow = stop === true || stop === 'true' || level === 0;
+
+    const payload = stopNow
       ? { command: 'Function', action: 'Stop', timeSec: 0, apiVer: 1 }
       : {
           command: 'Function',
-          action: `Vibrate:${parseInt(strength, 10) || 0}`,
-          timeSec: parseInt(duration, 10) || 5,
+          action: `Vibrate:${level}`,
+          timeSec: seconds,
           apiVer: 1
         };
 
@@ -687,8 +748,8 @@ app.post('/api/hud/vibrate', async (req, res) => {
       });
     }
 
-    const strengthNow = stop ? 0 : (parseInt(strength, 10) || 0);
-    const seconds = stop ? 0 : (parseInt(duration, 10) || 5);
+    const strengthNow = stopNow ? 0 : level;
+    const holdSeconds = strengthNow === 0 ? 0 : (seconds === 0 ? 3600 : seconds);
     await db.query(
       `UPDATE active_sessions
        SET vibe_strength = $2,
@@ -697,7 +758,7 @@ app.post('/api/hud/vibrate', async (req, res) => {
              ELSE NOW() + ($3 * INTERVAL '1 second')
            END
        WHERE sl_uuid = $1`,
-      [wearer_uuid, strengthNow, seconds]
+      [wearer_uuid, strengthNow, holdSeconds]
     );
 
     return res.json({ success: true, details: commandData });
