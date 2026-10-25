@@ -1438,9 +1438,21 @@ function hudMode(raw) {
 }
 
 const LINDENS_PER_MINUTE = 30;
+const MAX_SPAN_SECONDS = 6 * 30 * 24 * 60 * 60;
+const MAX_PRICE = 2147483647;
+
+function spanSeconds(body) {
+  const seconds = parseInt(body && body.seconds, 10);
+  if (Number.isFinite(seconds) && seconds >= 1) return seconds;
+  const minutes = parseInt(body && body.minutes, 10);
+  if (Number.isFinite(minutes) && minutes >= 1) return minutes * 60;
+  return 0;
+}
 
 function offerPrice(seconds, rate) {
-  return Math.max(1, Math.round((seconds / 60) * rate));
+  const price = Math.round((seconds / 60) * rate);
+  if (!Number.isFinite(price) || price < 1 || price > MAX_PRICE) return 0;
+  return price;
 }
 
 function secondsForPayment(amount, rate) {
@@ -1448,9 +1460,19 @@ function secondsForPayment(amount, rate) {
 }
 
 function offerLabel(seconds) {
-  if (seconds % 60 === 0) {
-    const minutes = seconds / 60;
-    return minutes === 1 ? '1 minute' : minutes + ' minutes';
+  seconds = Math.max(0, Math.floor(Number(seconds) || 0));
+  const units = [
+    [2592000, 'month'],
+    [604800, 'week'],
+    [86400, 'day'],
+    [3600, 'hour'],
+    [60, 'minute']
+  ];
+  for (const [size, name] of units) {
+    if (seconds >= size && seconds % size === 0) {
+      const count = seconds / size;
+      return count + ' ' + name + (count === 1 ? '' : 's');
+    }
   }
   if (seconds < 60) return seconds === 1 ? '1 second' : seconds + ' seconds';
   const minutes = Math.floor(seconds / 60);
@@ -1790,18 +1812,18 @@ app.post('/api/hud/visit-link', async (req, res) => {
   const recipient = String(req.body.recipient_uuid || '');
   const recipientName = String(req.body.recipient_name || 'someone').replace(/[\r\n\t]/g, ' ').trim().slice(0, 64) || 'someone';
   const sentName = String(req.body.sender_name || '').replace(/[\r\n\t]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 64);
-  const minutes = parseInt(req.body.minutes, 10);
+  const seconds = spanSeconds(req.body);
   const rate = Math.min(10000, Math.max(1, parseInt(req.body.per_minute, 10) || 0));
   if (!wearer || !recipient) return res.status(400).json({ error: "Missing avatar." });
   if (recipient === wearer) return res.status(400).json({ error: "Pick someone else." });
-  if (!minutes || minutes < 1 || minutes > 60) return res.status(400).json({ error: "Pick 1 to 60 minutes." });
+  if (!seconds || seconds > MAX_SPAN_SECONDS) return res.status(400).json({ error: "Pick a time from 1 second up to 6 months." });
   if (!rate) return res.status(400).json({ error: "Missing price." });
 
   try {
     const session = await getSession(wearer);
     const senderName = sentName || String((session && session.display_name) || '').trim();
     const token = crypto.randomBytes(18).toString('hex');
-    const seconds = minutes * 60;
+    const minutes = Math.max(1, Math.round(seconds / 60));
     await db.query(
       `INSERT INTO control_grants (token, wearer_uuid, recipient_uuid, recipient_name, sender_name, seconds_left, hud_mode, rate, expires_at)
        VALUES ($1, $2, $3, $4, $5, $6::int, 'hooker', $7::int, NOW() + ($8::int * INTERVAL '1 second'))`,
@@ -1823,11 +1845,11 @@ app.post('/api/hud/offer', async (req, res) => {
   const recipient = String(req.body.recipient_uuid || '');
   const recipientName = String(req.body.recipient_name || 'someone').replace(/[\r\n\t]/g, ' ').trim().slice(0, 64) || 'someone';
   const sentName = String(req.body.sender_name || '').replace(/[\r\n\t]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 64);
-  let seconds = parseInt(req.body.seconds, 10);
+  const seconds = spanSeconds(req.body);
   if (!wearer || !recipient) return res.status(400).json({ error: "Missing avatar." });
   if (recipient === wearer) return res.status(400).json({ error: "Pick someone else." });
-  if (!seconds || seconds < 1 || seconds > 3600) {
-    return res.status(400).json({ error: "Offer from 1 second up to 60 minutes." });
+  if (!seconds || seconds > MAX_SPAN_SECONDS) {
+    return res.status(400).json({ error: "Pick a time from 1 second up to 6 months." });
   }
 
   try {
@@ -1836,11 +1858,12 @@ app.post('/api/hud/offer', async (req, res) => {
       return res.status(404).json({ error: "Link your toy before sending an offer." });
     }
     if (hudMode(session.hud_mode) !== 'hooker') {
-      return res.status(400).json({ error: "Switch to hooker mode before sending an offer." });
+      await db.query(`UPDATE active_sessions SET hud_mode = 'hooker' WHERE sl_uuid = $1`, [wearer]);
     }
     const senderName = sentName || String(session.display_name || '').trim() || 'Someone';
     const rate = Math.min(10000, Math.max(1, parseInt(req.body.per_minute, 10) || LINDENS_PER_MINUTE));
     const price = offerPrice(seconds, rate);
+    if (!price) return res.status(400).json({ error: "That price is too large. Pick a shorter time." });
     const label = offerLabel(seconds);
     const id = crypto.randomBytes(18).toString('hex');
     await db.query(`UPDATE control_offers SET status = 'cancelled' WHERE wearer_uuid = $1 AND status = 'pending'`, [wearer]);
