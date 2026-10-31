@@ -857,7 +857,7 @@ function postHttpsJson(url, headers, body) {
       path: u.pathname,
       method: 'POST',
       rejectUnauthorized: false,
-      timeout: 1200,
+      timeout: 8000,
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(data),
@@ -900,16 +900,10 @@ async function sendLovenseCommand(uid, payload) {
   }
 }
 
-function remoteOnlyHost(domain) {
-  const host = String(domain || '');
-  if (!host || host.includes('127-0-0-1')) return true;
-  return /^(?:10|192-168|172-(?:1[6-9]|2\d|3[0-1]))-/.test(host);
-}
-
 async function sendToyCommand(uid, connection, payload) {
   const domain = connection && connection.domain;
   const port = connection && (connection.httpsPort || connection.wssPort);
-  if (domain && port && !remoteOnlyHost(domain)) {
+  if (domain && port && !String(domain).includes('127-0-0-1')) {
     try {
       const lan = await postHttpsJson(
         `https://${domain}:${port}/command`,
@@ -1005,10 +999,57 @@ function functionCommand(action, seconds, toyId) {
   return command;
 }
 
-const SEND_GAP_MS = 80;
+const STEP_MS = 100;
+const MIN_GAP_MS = 1000;
 
 function clampLevel(value) {
   return Math.max(0, Math.min(20, value | 0));
+}
+
+function buildGlide(from, to) {
+  const start = clampLevel(from);
+  const end = clampLevel(to);
+  if (start === end) return [end];
+  const sign = Math.sign(end - start);
+  const steps = [];
+  let level = start;
+  const add = (value) => {
+    if (steps.length < 50) steps.push(value);
+    if (steps.length < 50) steps.push(value);
+  };
+  add(level);
+  while (level !== end && steps.length < 48) {
+    level += sign;
+    add(level);
+  }
+  while (steps.length < 20) steps.push(steps[steps.length - 1]);
+  return steps;
+}
+
+function holdCommand(level, toyId) {
+  const command = {
+    command: 'Function',
+    action: `Vibrate:${clampLevel(level)}`,
+    timeSec: 0,
+    apiVer: 1,
+    stopPrevious: 1
+  };
+  if (toyId) command.toy = toyId;
+  return command;
+}
+
+function playingLevel(state) {
+  if (!state || !state.steps || !state.playStarted) return state ? clampLevel(state.at || 0) : 0;
+  const index = Math.min(state.steps.length - 1, Math.floor((Date.now() - state.playStarted) / STEP_MS));
+  return state.steps[index];
+}
+
+function glideCovers(state, target) {
+  if (!state || !state.playStarted) return false;
+  const goal = clampLevel(target);
+  if (state.flat) return state.at === goal && Date.now() < state.until;
+  if (!state.steps) return false;
+  return state.playUntil - Date.now() > 200;
 }
 
 const followers = new Map();
@@ -1044,6 +1085,18 @@ function ensureFollower(uid) {
   return state;
 }
 
+async function sendPattern(uid, connection, toyId, steps, timeSec) {
+  const pattern = {
+    command: 'Pattern',
+    rule: 'V:1;F:v;S:100#',
+    strength: steps.join(';'),
+    timeSec,
+    apiVer: 2
+  };
+  if (toyId) pattern.toy = toyId;
+  return sendToyCommand(uid, connection, pattern);
+}
+
 async function sendCustomPattern(uid, connection, toyId, steps, timeSec) {
   const pattern = {
     command: 'Pattern',
@@ -1069,7 +1122,7 @@ function schedulePlan(uid, delay) {
   state.timer = setTimeout(() => {
     state.timer = null;
     state.timerWait = null;
-    planLevel(uid).catch((err) => console.error('Slider command failed:', err.message));
+    planLevel(uid).catch((err) => console.error('Slider glide failed:', err.message));
   }, wait);
 }
 
@@ -1087,41 +1140,101 @@ async function planLevel(uid) {
     schedulePlan(uid, state.nextSendAt - Date.now());
     return;
   }
-  if (state.flat && state.at === target && (target === 0 || Date.now() < state.until)) return;
+  if (glideCovers(state, target)) {
+    const wait = state.flat
+      ? Math.max(400, state.until - Date.now())
+      : Math.max(200, state.playUntil - Date.now() - 200);
+    schedulePlan(uid, wait);
+    return;
+  }
 
+  const from = playingLevel(state);
+  if (from === target) {
+    if (target === 0) {
+      if (!state.flat && !state.steps) return;
+      const gen = state.gen;
+      state.busy = true;
+      try {
+        const result = await sendToyCommand(uid, state.connection, functionCommand('Stop', 0, state.toyId));
+        state.lastResult = result;
+        if (!followers.get(uid) || state.gen !== gen) return;
+        state.steps = null;
+        state.flat = false;
+        state.at = 0;
+        state.sentAt = Date.now();
+        state.playStarted = 0;
+        state.playUntil = 0;
+      } catch (err) {
+        console.error('Slider stop failed:', err.message);
+        state.lastResult = { code: 500, message: err.message };
+      } finally {
+        const current = followers.get(uid);
+        if (current && current.gen === gen) current.busy = false;
+      }
+      return;
+    }
+    if (state.flat && state.at === target) return;
+    const gen = state.gen;
+    state.busy = true;
+    try {
+      const result = await sendToyCommand(uid, state.connection, holdCommand(target, state.toyId));
+      state.lastResult = result;
+      if (!followers.get(uid) || state.gen !== gen) return;
+      if (!commandOk(result)) {
+        console.error('Slider hold rejected:', result && result.code, result && result.message);
+        state.nextSendAt = Date.now() + 1000;
+        return;
+      }
+      const started = Date.now();
+      state.flat = true;
+      state.steps = null;
+      state.at = target;
+      state.sentAt = started;
+      state.playStarted = started;
+      state.playUntil = state.until;
+      state.nextSendAt = started;
+    } catch (err) {
+      console.error('Slider hold failed:', err.message);
+      state.lastResult = { code: 500, message: err.message };
+      state.nextSendAt = Date.now() + 1000;
+    } finally {
+      const current = followers.get(uid);
+      if (current && current.gen === gen) current.busy = false;
+    }
+    return;
+  }
+
+  const steps = buildGlide(from, target);
+  const timeSec = Number((steps.length * 0.1).toFixed(1));
   const gen = state.gen;
   state.busy = true;
   try {
-    const seconds = Math.max(1, Math.ceil((state.until - Date.now()) / 1000));
-    const command = target === 0
-      ? functionCommand('Stop', 0, state.toyId)
-      : functionCommand(`Vibrate:${target}`, seconds, state.toyId);
-    const result = await sendToyCommand(uid, state.connection, command);
+    const result = await sendPattern(uid, state.connection, state.toyId, steps, timeSec);
     state.lastResult = result;
     if (!followers.get(uid) || state.gen !== gen) return;
     if (!commandOk(result)) {
-      console.error('Slider command rejected:', result && result.code, result && result.message);
-      state.nextSendAt = Date.now() + 400;
+      console.error('Slider pattern rejected:', result && result.code, result && result.message);
+      state.nextSendAt = Date.now() + 1000;
       return;
     }
     const started = Date.now();
-    state.flat = true;
-    state.steps = null;
-    state.at = target;
+    state.steps = steps;
+    state.flat = false;
+    state.at = from;
     state.sentAt = started;
     state.playStarted = started;
-    state.playUntil = target === 0 ? 0 : state.until;
-    state.nextSendAt = started + SEND_GAP_MS;
+    state.playUntil = started + timeSec * 1000;
+    state.nextSendAt = state.playUntil - 200;
   } catch (err) {
-    console.error('Slider command failed:', err.message);
+    console.error('Slider pattern failed:', err.message);
     state.lastResult = { code: 500, message: err.message };
-    state.nextSendAt = Date.now() + 400;
+    state.nextSendAt = Date.now() + 1000;
   } finally {
     const current = followers.get(uid);
     if (current && current.gen === gen) {
       current.busy = false;
-      if (clampLevel(current.target) !== current.at && (Date.now() < current.until || clampLevel(current.target) === 0)) {
-        schedulePlan(uid, Math.max(0, current.nextSendAt - Date.now()));
+      if (!current.flat && current.steps && (Date.now() < current.until || clampLevel(current.target) === 0)) {
+        schedulePlan(uid, Math.max(200, current.playUntil - Date.now() - 200));
       }
     }
   }
@@ -1133,12 +1246,8 @@ async function sendSmoothLevel(uid, connection, toyId, target, seconds) {
   state.toyId = toyId || state.toyId;
   state.target = clampLevel(target);
   state.until = Date.now() + Math.max(1, seconds) * 1000;
-  if (state.busy) return state.lastResult || { code: 200, result: true };
-  if (state.flat && state.at === state.target && (state.target === 0 || Date.now() < state.until)) {
-    return state.lastResult || { code: 200, result: true };
-  }
-  if (Date.now() < state.nextSendAt) {
-    schedulePlan(uid, state.nextSendAt - Date.now());
+  if (state.busy || Date.now() < state.nextSendAt || glideCovers(state, state.target)) {
+    schedulePlan(uid, state.busy ? 0 : Math.max(0, state.nextSendAt - Date.now()));
     return state.lastResult || { code: 200, result: true };
   }
   await planLevel(uid);
@@ -2337,7 +2446,7 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
     ${guestToken && pageMode === 'hooker' ? hookerNeonSign() : ""}
   </header>
   <p id="senderName" class="sender"${ownerName ? "" : " hidden"}></p>
-  <p id="intro">Move the slider. The toy follows it.</p>
+  <p id="intro">Move the slider. The motor stays on and the strength eases while you drag.</p>
   <button type="button" id="hudMode" class="secondary">Normal HUD</button>
   <p id="grantLine" class="pattern-note"></p>
   <p id="addTime" class="pattern-note" hidden></p>
@@ -2494,11 +2603,11 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
             status.textContent = e.message || "Command failed.";
           });
           status.textContent = level === 0
-            ? "Off."
+            ? "Easing off."
             : ("Strength " + level + " of 100");
         }
         if (toyStep(desired) !== lastSent) queueSend(false);
-      }, lastSent < 0 ? 0 : 40);
+      }, lastSent < 0 ? 0 : 150);
     }
 
     strength.oninput = () => {
