@@ -1040,7 +1040,8 @@ function functionCommand(action, seconds, toyId, indefinite) {
   return command;
 }
 
-const SEND_GAP_MS = 0;
+const SEND_GAP_MS = 60;
+const STEP_MS = 50;
 
 function clampLevel(value) {
   return Math.max(0, Math.min(20, value | 0));
@@ -1084,6 +1085,56 @@ function ensureFollower(uid) {
   return state;
 }
 
+function buildRamp(from, to) {
+  const start = clampLevel(from);
+  const end = clampLevel(to);
+  if (start === end) return [end];
+  const sign = end > start ? 1 : -1;
+  const steps = [];
+  for (let level = start + sign; level !== end + sign && steps.length < 20; level += sign) {
+    steps.push(level);
+  }
+  return steps;
+}
+
+function glideSteps(from, to) {
+  const start = clampLevel(from);
+  const end = clampLevel(to);
+  const sign = end === start ? 0 : (end > start ? 1 : -1);
+  const distance = Math.min(4, Math.abs(end - start));
+  const steps = [];
+  let level = start;
+  for (let i = 0; i < distance; i++) {
+    level += sign;
+    steps.push(level);
+  }
+  if (!steps.length) steps.push(end);
+  const landed = steps[steps.length - 1];
+  const rampLen = steps.length;
+  while (steps.length < rampLen + 12 && steps.length < 50) steps.push(landed);
+  return steps;
+}
+
+function playingLevel(state) {
+  if (!state) return 0;
+  if (state.flat || !state.steps || !state.playStarted) return clampLevel(state.at || 0);
+  const index = Math.min(state.steps.length - 1, Math.floor((Date.now() - state.playStarted) / STEP_MS));
+  return state.steps[index];
+}
+
+async function sendGlide(uid, connection, toyId, steps, signal) {
+  const pattern = {
+    command: 'Pattern',
+    rule: 'V:1;F:v;S:50#',
+    strength: steps.join(';'),
+    timeSec: Math.max(0.2, Math.round(steps.length * STEP_MS) / 1000),
+    apiVer: 2,
+    stopPrevious: 1
+  };
+  if (toyId) pattern.toy = toyId;
+  return sendToyCommand(uid, connection, pattern, signal);
+}
+
 async function sendCustomPattern(uid, connection, toyId, steps, timeSec) {
   const pattern = {
     command: 'Pattern',
@@ -1115,7 +1166,7 @@ function schedulePlan(uid, delay) {
 
 async function planLevel(uid) {
   const state = followers.get(uid);
-  if (!state || state.busy) return;
+  if (!state || state.busy || state.local) return;
   if (state.timer) {
     clearTimeout(state.timer);
     state.timer = null;
@@ -1124,57 +1175,98 @@ async function planLevel(uid) {
   const target = clampLevel(state.target);
   const holding = !!(state.hold && target !== 0);
   if (!holding && Date.now() >= state.until && target !== 0) return;
-  if (Date.now() < state.nextSendAt) {
+  if (Date.now() < state.nextSendAt && target !== 0) {
     schedulePlan(uid, state.nextSendAt - Date.now());
     return;
   }
-  if (state.flat && state.at === target && (target === 0 || holding || Date.now() < state.until)) return;
+  const from = playingLevel(state);
+  if (target !== 0 && state.rampUntil && Date.now() < state.rampUntil && state.heading) {
+    const want = Math.sign(target - from);
+    if (want === 0 || want === state.heading) {
+      schedulePlan(uid, state.rampUntil - Date.now());
+      return;
+    }
+  }
+  if (target !== 0 && from === target && state.flat && (holding || Date.now() < state.until)) return;
 
   const gen = state.gen;
-  const sentSeq = state.seq;
   state.busy = true;
   state.sending = target;
   if (state.abort) state.abort.abort();
   const abort = new AbortController();
   state.abort = abort;
+  const steps = target === 0 || from === target ? null : glideSteps(from, target);
   try {
     const seconds = holding ? 0 : Math.max(1, Math.ceil((state.until - Date.now()) / 1000));
-    const command = target === 0
-      ? functionCommand('Stop', 0, state.toyId)
-      : functionCommand(`Vibrate:${target}`, seconds, state.toyId, holding);
-    const result = await sendToyCommand(uid, state.connection, command, abort.signal);
+      const result = steps
+      ? await sendGlide(uid, state.connection, state.toyId, steps, abort.signal)
+      : await sendToyCommand(
+        uid,
+        state.connection,
+        target === 0
+          ? functionCommand('Stop', 0, state.toyId)
+          : functionCommand(`Vibrate:${target}`, seconds, state.toyId, holding),
+        abort.signal
+      );
     state.lastResult = result;
-    if (!followers.get(uid) || state.gen !== gen) return;
-    if (state.seq !== sentSeq || clampLevel(state.target) !== target) {
-      state.flat = false;
-      return;
-    }
+    if (!followers.get(uid) || state.gen !== gen || state.local) return;
     if (!commandOk(result)) {
       console.error('Slider command rejected:', result && result.code, result && result.message);
       state.nextSendAt = Date.now() + 200;
       return;
     }
     const started = Date.now();
-    state.flat = true;
-    state.steps = null;
-    state.at = target;
+    const liveTarget = clampLevel(state.target);
     state.sentAt = started;
-    state.playStarted = started;
-    state.playUntil = target === 0 ? 0 : state.until;
     state.nextSendAt = started + SEND_GAP_MS;
+    if (steps) {
+      const rampCount = steps.findIndex((level, index) => index > 0 && level === steps[index - 1]);
+      const rampSteps = rampCount === -1 ? 1 : rampCount;
+      const landed = steps[Math.max(0, rampSteps - 1)];
+      state.flat = false;
+      state.steps = steps;
+      state.at = landed;
+      state.heading = Math.sign(landed - from) || state.heading || 0;
+      state.playStarted = started;
+      state.rampUntil = started + rampSteps * STEP_MS;
+      state.playUntil = started + steps.length * STEP_MS;
+      const want = Math.sign(liveTarget - landed);
+      if (liveTarget === 0 || (want && state.heading && want !== state.heading)) {
+        state.refreshAt = started;
+      } else if (landed === liveTarget) {
+        state.refreshAt = Math.max(state.rampUntil, state.playUntil - 250);
+      } else {
+        state.refreshAt = state.rampUntil;
+      }
+    } else {
+      state.flat = true;
+      state.steps = null;
+      state.at = target;
+      state.heading = 0;
+      state.rampUntil = 0;
+      state.playStarted = started;
+      state.playUntil = target === 0 ? 0 : (holding ? state.until : started + seconds * 1000);
+      state.refreshAt = 0;
+    }
   } catch (err) {
     const aborted = abort.signal.aborted || err.name === 'AbortError' || err.message === 'aborted';
     if (!aborted) {
       console.error('Slider command failed:', err.message);
       state.lastResult = { code: 500, message: err.message };
       state.nextSendAt = Date.now() + 200;
+      state.flat = false;
     }
-    state.flat = false;
   } finally {
     const current = followers.get(uid);
     if (current && current.gen === gen) {
       current.busy = false;
-      if (clampLevel(current.target) !== current.at && (current.hold || Date.now() < current.until || clampLevel(current.target) === 0)) {
+      if (current.local) {
+        current.refreshAt = 0;
+      } else if (current.refreshAt) {
+        const wait = Math.max(0, current.refreshAt - Date.now());
+        current.refreshAt = 0;
+        schedulePlan(uid, wait);
+      } else if (clampLevel(current.target) !== current.at && (current.hold || Date.now() < current.until || clampLevel(current.target) === 0)) {
         schedulePlan(uid, Math.max(0, current.nextSendAt - Date.now()));
       }
     }
@@ -1192,14 +1284,16 @@ async function sendSmoothLevel(uid, connection, toyId, target, seconds, hold, se
   state.until = state.hold
     ? Number.POSITIVE_INFINITY
     : Date.now() + Math.max(1, seconds) * 1000;
+  const takeOver = !!state.local;
+  state.local = false;
   if (state.busy) {
     if (state.target === 0 && state.abort) state.abort.abort();
     return state.lastResult || { code: 200, result: true };
   }
-  if (state.flat && state.at === state.target && (state.target === 0 || state.hold || Date.now() < state.until)) {
+  if (!takeOver && state.flat && state.at === state.target && (state.target === 0 || state.hold || Date.now() < state.until)) {
     return state.lastResult || { code: 200, result: true };
   }
-  if (Date.now() < state.nextSendAt) {
+  if (state.target !== 0 && Date.now() < state.nextSendAt) {
     schedulePlan(uid, state.nextSendAt - Date.now());
     return state.lastResult || { code: 200, result: true };
   }
@@ -2546,6 +2640,14 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
     let flying = false;
     let dirty = false;
     let commandSeq = 0;
+    let glideSteps = null;
+    let glideStarted = 0;
+    let rampUntil = 0;
+    let rampMs = 0;
+    let holdMs = 0;
+    let settleDue = 0;
+    let glideHeading = 0;
+    let sendAt = 0;
     let localWorks = null;
     let localChain = Promise.resolve();
     let localCommand = "";
@@ -2579,18 +2681,126 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
       return Math.max(1, Math.round((p * max) / 100));
     }
 
+    function playingNow() {
+      if (!glideSteps || !glideStarted) return 0;
+      const index = Math.min(glideSteps.length - 1, Math.floor((Date.now() - glideStarted) / 50));
+      return glideSteps[index];
+    }
+
+    function rememberGlide(to) {
+      const from = playingNow();
+      const end = to | 0;
+      const sign = end === from ? 0 : (end > from ? 1 : -1);
+      const distance = Math.min(4, Math.abs(end - from));
+      const steps = [];
+      let level = from;
+      for (let i = 0; i < distance; i++) {
+        level += sign;
+        steps.push(level);
+      }
+      if (!steps.length) steps.push(end);
+      const landed = steps[steps.length - 1];
+      const rampLen = steps.length;
+      while (steps.length < rampLen + 12 && steps.length < 50) steps.push(landed);
+      const now = Date.now();
+      glideSteps = steps;
+      glideStarted = now;
+      glideHeading = sign;
+      rampMs = distance * 50;
+      holdMs = (steps.length - rampLen) * 50;
+      rampUntil = now + rampMs;
+      settleDue = landed === end ? now + rampMs + holdMs - 250 : 0;
+      return steps;
+    }
+
+    function clearGlide() {
+      glideSteps = null;
+      glideStarted = 0;
+      glideHeading = 0;
+      rampUntil = 0;
+      rampMs = 0;
+      holdMs = 0;
+      settleDue = 0;
+    }
+
+    function lockLevel(step) {
+      glideSteps = [step];
+      glideStarted = Date.now();
+      glideHeading = 0;
+      rampUntil = 0;
+      rampMs = 0;
+      holdMs = 0;
+      settleDue = 0;
+    }
+
+    function followWait() {
+      const step = toyStep(desired);
+      if (step === 0 || lastSent < 0) return 0;
+      const want = Math.sign(step - playingNow());
+      if (want && glideHeading && want !== glideHeading) return 0;
+      if (!want) return settleDue ? Math.max(0, settleDue - Date.now()) : 0;
+      return Math.max(0, rampUntil - Date.now());
+    }
+
+    function armSend(gen) {
+      const wait = followWait();
+      const at = Date.now() + wait;
+      if (sendTimer) {
+        if (sendAt <= at) return;
+        clearTimeout(sendTimer);
+      }
+      sendAt = at;
+      sendTimer = setTimeout(() => {
+        sendTimer = null;
+        sendSlider(gen, false);
+      }, wait);
+    }
+
     function localPayload(levels, seconds, holding, stop) {
       if (stop) {
+        clearGlide();
         return { command: "Function", action: "Stop", timeSec: 0, apiVer: 1, stopPrevious: 1 };
       }
       if ((levels.Position || 0) > 0 || (levels.Stroke || 0) > 0) return null;
       const order = ["Vibrate", "Vibrate1", "Vibrate2", "Vibrate3", "Rotate", "Pump", "Thrusting", "Fingering", "Suction", "Depth", "Oscillate"];
+      const vibeOnly = !order.some((name) => name !== "Vibrate" && (levels[name] || 0) > 0);
+      if (vibeOnly) {
+        const step = toyStep(levels.Vibrate || 0);
+        if (step <= 0) {
+          clearGlide();
+          return { command: "Function", action: "Stop", timeSec: 0, apiVer: 1, stopPrevious: 1 };
+        }
+        if (step === playingNow()) {
+          lockLevel(step);
+          const holdPayload = {
+            command: "Function",
+            action: "Vibrate:" + step,
+            timeSec: holding ? 0 : Math.max(1, seconds),
+            apiVer: 1,
+            stopPrevious: 1
+          };
+          if (toySelect.value) holdPayload.toy = toySelect.value;
+          return holdPayload;
+        }
+        const steps = rememberGlide(step);
+        const payload = {
+          command: "Pattern",
+          rule: "V:1;F:v;S:50#",
+          strength: steps.join(";"),
+          timeSec: Math.max(0.2, Math.round(steps.length * 50) / 1000),
+          apiVer: 2,
+          stopPrevious: 1
+        };
+        if (toySelect.value) payload.toy = toySelect.value;
+        return payload;
+      }
       const parts = [];
       order.forEach((name) => {
         const level = localScale(name, levels[name] || 0);
         if (level > 0) parts.push(name + ":" + level);
       });
       if (!parts.length) {
+        clearGlide();
         return { command: "Function", action: "Stop", timeSec: 0, apiVer: 1, stopPrevious: 1 };
       }
       const payload = {
@@ -2651,7 +2861,7 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
       flying = false;
       if (!dirty) return;
       dirty = false;
-      sendSlider(gen, false);
+      armSend(gen);
     }
 
     function sendSlider(gen, immediateStop) {
@@ -2687,9 +2897,11 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
         }
         const level = desired;
         const step = toyStep(level);
+        const here = playingNow();
         seconds = holding || level === 0 ? 0 : remaining();
         if (!holding && level > 0 && seconds <= 0) return finishFlight(gen);
-        if (step === lastSent) return finishFlight(gen);
+        const tracking = !!(glideSteps && glideStarted);
+        if (step === lastSent && (!tracking || (step === here && !settleDue))) return finishFlight(gen);
         lastSent = step;
         body = commandBody(level, seconds, false, holding && level > 0);
         status.textContent = level === 0
@@ -2697,10 +2909,36 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
           : (holding ? ("On at " + level + ". It stops at 0.") : ("Strength " + level + " of 100"));
       }
       body.seq = ++commandSeq;
+      const snap = {
+        steps: glideSteps,
+        started: glideStarted,
+        until: rampUntil,
+        heading: glideHeading,
+        rampMs: rampMs,
+        holdMs: holdMs,
+        settle: settleDue
+      };
       const payload = localPayload(levels, seconds, holding && !immediateStop, immediateStop || !levelsOn(levels));
       pushLocal(payload).then(async (delivered) => {
+        if (!delivered && !immediateStop) {
+          glideSteps = snap.steps;
+          glideStarted = snap.started;
+          rampUntil = snap.until;
+          glideHeading = snap.heading;
+          rampMs = snap.rampMs;
+          holdMs = snap.holdMs;
+          settleDue = snap.settle;
+        } else if (delivered && payload && payload.command === "Pattern") {
+          const now = Date.now();
+          glideStarted = now;
+          rampUntil = now + rampMs;
+          if (settleDue) settleDue = now + rampMs + holdMs - 250;
+        }
         if (gen !== flightGen) return;
         body.delivered = !!delivered;
+        if (delivered && !immediateStop && toyStep(desired) > 0 && (settleDue || toyStep(desired) !== playingNow())) {
+          dirty = true;
+        }
         if (delivered && !immediateStop) {
           postCommand(body).catch(() => {});
           return;
@@ -2725,6 +2963,8 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
         lastSent = 0;
         lastLevels = "";
         wasMulti = false;
+        clearGlide();
+        sendAt = 0;
         status.textContent = "Stopped.";
         sendSlider(flightGen, true);
         return;
@@ -2733,12 +2973,7 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
         dirty = true;
         return;
       }
-      if (sendTimer) return;
-      const gen = flightGen;
-      sendTimer = setTimeout(() => {
-        sendTimer = null;
-        sendSlider(gen, false);
-      }, 0);
+      armSend(flightGen);
     }
 
     strength.oninput = () => {
@@ -4264,6 +4499,12 @@ app.post('/api/hud/vibrate', async (req, res) => {
       if (seq) seen.seq = seq;
       seen.connection = session.connection;
       seen.toyId = toy_id || seen.toyId;
+      if (seen.timer) {
+        clearTimeout(seen.timer);
+        seen.timer = null;
+        seen.timerWait = null;
+      }
+      seen.local = true;
       seen.target = level;
       seen.at = level;
       seen.flat = true;
