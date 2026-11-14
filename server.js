@@ -157,6 +157,13 @@ async function ensureSchema() {
     bytes BYTEA NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
+  await db.query(`CREATE TABLE IF NOT EXISTS hud_demos (
+    sl_uuid TEXT PRIMARY KEY,
+    demo_expires TIMESTAMPTZ NOT NULL,
+    purchased BOOLEAN NOT NULL DEFAULT FALSE,
+    purchased_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
   await db.query(`CREATE TABLE IF NOT EXISTS time_adds (
     id TEXT PRIMARY KEY,
     wearer_uuid TEXT NOT NULL,
@@ -1603,12 +1610,81 @@ app.get('/', async (req, res) => {
   }
 });
 
+function demoView(row) {
+  if (!row) return { demo: false, ok: true };
+  if (row.purchased) return { demo: false, ok: true, purchased: true };
+  const left = Math.floor((new Date(row.demo_expires).getTime() - Date.now()) / 1000);
+  if (left > 0) return { demo: true, ok: true, seconds_left: left };
+  return {
+    demo: true,
+    ok: false,
+    seconds_left: 0,
+    error: "This demo is over. This avatar cannot start another one."
+  };
+}
+
+async function readDemo(uuid) {
+  const found = await db.query(
+    `SELECT demo_expires, purchased FROM hud_demos WHERE sl_uuid = $1`,
+    [uuid]
+  );
+  return found.rows[0] || null;
+}
+
+async function demoGate(uuid) {
+  return demoView(await readDemo(uuid));
+}
+
+app.post('/api/hud/demo', async (req, res) => {
+  const uuid = String(req.body.sl_uuid || '');
+  if (!uuid) return res.status(400).json({ error: "Missing avatar." });
+  try {
+    let row = await readDemo(uuid);
+    if (!row) {
+      const created = await db.query(
+        `INSERT INTO hud_demos (sl_uuid, demo_expires)
+         VALUES ($1, NOW() + INTERVAL '2 days')
+         ON CONFLICT (sl_uuid) DO NOTHING
+         RETURNING demo_expires, purchased`,
+        [uuid]
+      );
+      row = created.rows[0] || await readDemo(uuid);
+    }
+    const state = demoView(row);
+    if (!state.ok) return res.status(403).json({ success: false, ...state });
+    return res.json({ success: true, ...state });
+  } catch (err) {
+    console.error("Demo start error:", err);
+    res.status(500).json({ error: "Could not start the demo." });
+  }
+});
+
+app.post('/api/hud/demo/purchase', async (req, res) => {
+  const uuid = String(req.body.sl_uuid || '');
+  if (!uuid) return res.status(400).json({ error: "Missing avatar." });
+  try {
+    await db.query(
+      `INSERT INTO hud_demos (sl_uuid, demo_expires, purchased, purchased_at)
+       VALUES ($1, NOW(), true, NOW())
+       ON CONFLICT (sl_uuid) DO UPDATE SET purchased = true, purchased_at = NOW()`,
+      [uuid]
+    );
+    return res.json({ success: true, purchased: true });
+  } catch (err) {
+    console.error("Demo purchase error:", err);
+    res.status(500).json({ error: "Could not record the purchase." });
+  }
+});
+
 app.post('/api/hud/register', async (req, res) => {
   const { sl_uuid, sl_http_url, sl_name } = req.body;
 
   if (!sl_uuid || !sl_http_url) {
     return res.status(400).json({ error: "Missing avatar UUID or HTTP URL data." });
   }
+
+  const demo = await demoGate(sl_uuid);
+  if (!demo.ok) return res.status(403).json({ error: demo.error });
 
   if (!LOVENSE_TOKEN) {
     return res.status(500).json({ error: "LOVENSE_DEVELOPER_TOKEN is not set on the server." });
@@ -4018,6 +4094,31 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
 </html>`);
 }
 
+function demoEndedPage() {
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Love Touched</title>
+  <style>
+    body { margin: 0; background: #07010f; font-family: sans-serif; color: #ff4dff; }
+    main { max-width: 520px; margin: 0 auto; padding: 36px 22px; }
+    img { display: block; width: 220px; height: 220px; margin: 0 auto 16px; border-radius: 50%; object-fit: cover; }
+    h1, p { text-shadow: 0 0 8px #ff2bd6, 0 8px 18px #3b0764; }
+  </style>
+</head>
+<body>
+  <main>
+    <img src="/logo.png" alt="Mālama Hōkū">
+    <h1>Love Touched</h1>
+    <p>This demo is over. This avatar cannot start another one, and this control link stays closed.</p>
+    <p>On the demo HUD, press Buy and pay L$1000 for the full version.</p>
+  </main>
+</body>
+</html>`;
+}
+
 function guestMessage(text) {
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Mālama Hōkū</title></head><body style="font-family:sans-serif;background:#111;color:#eee;max-width:420px;margin:0 auto;padding:24px"><img src="/logo.png" alt="Mālama Hōkū" style="width:220px;height:220px;border-radius:50%;object-fit:cover;display:block;margin:0 0 8px"><h1>Mālama Hōkū</h1><p>${text}</p></body></html>`;
 }
@@ -4026,8 +4127,15 @@ app.get('/left', (req, res) => {
   res.type('html').send(guestMessage("You left. You must be 18 or older to enter."));
 });
 
-app.get('/control/:sl_uuid', (req, res) => {
-  sendControlPage(res, req.params.sl_uuid, "", 0, "");
+app.get('/control/:sl_uuid', async (req, res) => {
+  try {
+    const demo = await demoGate(req.params.sl_uuid);
+    if (!demo.ok) return res.status(403).type('html').send(demoEndedPage());
+    sendControlPage(res, req.params.sl_uuid, "", 0, "");
+  } catch (err) {
+    console.error(err);
+    res.status(500).type('html').send(guestMessage("Could not open the controls."));
+  }
 });
 
 app.get('/guest/:token', async (req, res) => {
@@ -4387,6 +4495,8 @@ app.post('/api/hud/custom-pattern', async (req, res) => {
   const actor = await resolveControl(req.body);
   if (actor.error) return res.status(actor.status).json({ error: actor.error });
   const wearer = actor.wearer;
+  const customDemo = await demoGate(wearer);
+  if (!customDemo.ok) return res.status(403).json({ error: customDemo.error });
   if (!actor.guest) await releaseGuestRun(wearer);
 
   try {
@@ -4459,6 +4569,8 @@ app.post('/api/hud/pattern', async (req, res) => {
   const actor = await resolveControl(req.body);
   if (actor.error) return res.status(actor.status).json({ error: actor.error });
   const wearer = actor.wearer;
+  const presetDemo = await demoGate(wearer);
+  if (!presetDemo.ok) return res.status(403).json({ error: presetDemo.error });
   const name = String(req.body.name || '').toLowerCase();
   if (!LOVENSE_PRESETS.has(name)) {
     return res.status(400).json({ error: "Choose pulse, wave, fireworks, or earthquake." });
@@ -4532,6 +4644,8 @@ app.post('/api/hud/vibrate', async (req, res) => {
   const actor = await resolveControl(req.body);
   if (actor.error) return res.status(actor.status).json({ error: actor.error });
   const wearer_uuid = actor.wearer;
+  const vibeDemo = await demoGate(wearer_uuid);
+  if (!vibeDemo.ok) return res.status(403).json({ error: vibeDemo.error });
   const { strength, duration, toy_id, stop } = req.body;
   const seq = parseInt(req.body.seq, 10) || 0;
   const delivered = req.body.delivered === true || req.body.delivered === 'true';
