@@ -100,6 +100,9 @@ app.get('/logo.png', (req, res) => {
   const root = path.join(__dirname, 'logo.png');
   res.sendFile(fs.existsSync(nested) ? nested : root);
 });
+app.get('/love-touched', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'love-touched.html'));
+});
 
 const db = new Pool({
   connectionString: process.env.DATABASE_URL,
