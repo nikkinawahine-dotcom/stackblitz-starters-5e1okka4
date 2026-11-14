@@ -1640,16 +1640,18 @@ app.get('/pair/:sl_uuid', (req, res) => {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Link Lovense</title>
+  <title>Mālama Hōkū</title>
   <style>
     body { font-family: sans-serif; background: #111; color: #eee; text-align: center; padding: 24px; }
-    img { width: 260px; height: 260px; background: #fff; padding: 12px; border-radius: 8px; }
+    img.logo { width: 240px; height: 240px; border-radius: 50%; object-fit: cover; display: block; margin: 0 auto 8px; }
+    #qr { width: 260px; height: 260px; background: #fff; padding: 12px; border-radius: 8px; }
     #status { margin-top: 16px; font-size: 18px; }
     a { color: #ff7ad9; }
   </style>
 </head>
 <body>
-  <h1>Scan with Lovense Remote</h1>
+  <img class="logo" src="/logo.png" alt="Mālama Hōkū">
+  <h1>Mālama Hōkū</h1>
   <p>Open Lovense Remote, use Scan QR, then wait until this page says connected.</p>
   <img id="qr" src="${qrSrc}" alt="Lovense QR code">
   <p id="status">Waiting for scan…</p>
@@ -2182,18 +2184,20 @@ app.get('/offer/:id', async (req, res) => {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   ${fresh ? '<meta http-equiv="refresh" content="4">' : ''}
-  <title>${name} — Hot Hawaiian Nights</title>
+  <title>${name} — Mālama Hōkū</title>
   <link href="https://fonts.googleapis.com/css2?family=Pacifico&display=swap" rel="stylesheet">
   <style>
     body { font-family: sans-serif; background: #160208; color: #ffe8ee; max-width: 420px; margin: 0 auto; padding: 24px; }
     h1 { margin: 0 0 8px; font-family: "Pacifico", cursive; font-size: 30px; font-weight: 400; background: linear-gradient(100deg, #ffe08a, #ff8a1e 40%, #ff3d6e 75%, #ff4df0); -webkit-background-clip: text; background-clip: text; color: transparent; }
+    img.logo { width: 220px; height: 220px; border-radius: 50%; object-fit: cover; display: block; margin: 0 0 8px; }
     .name { margin: 0; color: #ff5a7a; font-size: 22px; font-weight: bold; letter-spacing: 0.04em; text-transform: uppercase; }
     .price { font-size: 28px; font-weight: bold; color: #ffe08a; margin: 12px 0; }
     p { color: #ffc1cf; }
   </style>
 </head>
 <body>
-  <h1>HOT HAWAIIAN NIGHTS</h1>
+  <img class="logo" src="/logo.png" alt="Mālama Hōkū">
+  <h1>Mālama Hōkū</h1>
   <p class="name">${name}</p>
   <p>${name} is offering ${label}.</p>
   <p class="price">L$${offer.price}</p>
@@ -2255,15 +2259,17 @@ app.get('/control', (req, res) => {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Choose a partner</title>
+  <title>Mālama Hōkū</title>
   <style>
     body { font-family: sans-serif; background: #111; color: #eee; max-width: 420px; margin: 0 auto; padding: 24px; }
     a { display: block; background: #ff4da6; color: #fff; text-decoration: none; padding: 14px; border-radius: 8px; margin: 8px 0; text-align: center; font-weight: bold; }
+    img.logo { width: 220px; height: 220px; border-radius: 50%; object-fit: cover; display: block; margin: 0 0 8px; }
     p { color: #ccc; }
   </style>
 </head>
 <body>
-  <h1>Control a partner</h1>
+  <img class="logo" src="/logo.png" alt="Mālama Hōkū">
+  <h1>Mālama Hōkū</h1>
   <p>These avatars shared their linked toy.</p>
   <div id="list">Loading…</div>
   <script>
@@ -2313,7 +2319,8 @@ function hookerNeonSign() {
 function ageGate() {
   return `<div class="age-gate" id="ageGate" role="dialog" aria-modal="true" aria-labelledby="ageTitle">
     <div class="age-card">
-      <h2 id="ageTitle">HOT HAWAIIAN NIGHTS</h2>
+      <img class="logo" src="/logo.png" alt="Mālama Hōkū">
+      <h2 id="ageTitle">Mālama Hōkū</h2>
       <p>You must be 18 or older to enter.</p>
       <div class="age-actions">
         <button type="button" id="ageEnter">Enter</button>
@@ -2350,7 +2357,7 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${ownerName ? "Control " + ownerName.replace(/[&<>"]/g, "") + " — Hot Hawaiian Nights" : "Hot Hawaiian Nights"}</title>
+  <title>${ownerName ? "Control " + ownerName.replace(/[&<>"]/g, "") + " — Mālama Hōkū" : "Mālama Hōkū"}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Great+Vibes&family=Pacifico&display=swap" rel="stylesheet">
@@ -2425,6 +2432,7 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
       display: flex; align-items: center; justify-content: center; padding: 24px; text-align: center;
     }
     .age-card { width: min(320px, 100%); }
+    .age-card img.logo { width: 200px; height: 200px; border-radius: 50%; object-fit: cover; display: block; margin: 0 auto 8px; }
     .age-card h2 {
       margin: 0 0 10px; font-family: "Pacifico", cursive; font-size: 32px; font-weight: 400;
       background: linear-gradient(100deg, #ffe08a, #ff8a1e 40%, #ff3d6e 75%, #ff4df0);
@@ -2441,8 +2449,8 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
 <body class="${guestToken && pageMode === 'hooker' ? 'hooker locked' : ''}">
   ${guestToken && pageMode === 'hooker' ? ageGate() : ""}
   <header class="brand">
-    <img src="/logo.png" alt="Hot Hawaiian Nights">
-    <h1>HOT HAWAIIAN NIGHTS</h1>
+    <img src="/logo.png" alt="Mālama Hōkū">
+    <h1>Mālama Hōkū</h1>
     ${guestToken && pageMode === 'hooker' ? hookerNeonSign() : ""}
   </header>
   <p id="senderName" class="sender"${ownerName ? "" : " hidden"}></p>
@@ -3191,7 +3199,7 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
       ownerName = name;
       sender.hidden = false;
       sender.textContent = name;
-      document.title = "Control " + name + " — Hot Hawaiian Nights";
+      document.title = "Control " + name + " — Mālama Hōkū";
     }
 
     function shownGrantLeft() {
@@ -3430,7 +3438,7 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
 }
 
 function guestMessage(text) {
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Hot Hawaiian Nights</title></head><body style="font-family:sans-serif;background:#111;color:#eee;max-width:420px;margin:0 auto;padding:24px"><h1>Hot Hawaiian Nights</h1><p>${text}</p></body></html>`;
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Mālama Hōkū</title></head><body style="font-family:sans-serif;background:#111;color:#eee;max-width:420px;margin:0 auto;padding:24px"><img src="/logo.png" alt="Mālama Hōkū" style="width:220px;height:220px;border-radius:50%;object-fit:cover;display:block;margin:0 0 8px"><h1>Mālama Hōkū</h1><p>${text}</p></body></html>`;
 }
 
 app.get('/left', (req, res) => {
