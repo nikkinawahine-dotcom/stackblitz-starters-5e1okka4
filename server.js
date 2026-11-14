@@ -2478,12 +2478,18 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
     .add-custom { display: grid; grid-template-columns: 1fr auto; gap: 6px; margin-top: 6px; }
     .add-custom input, .add-custom button { margin: 0; }
     .patterns button { margin: 0; background: #6b2d78; }
+    .patterns button.live, .saved-row button.live, #playDraft.live { background: #1f9d4a; }
+    .on-word {
+      display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 8px;
+      background: rgba(0,0,0,0.28); font-size: 10px; letter-spacing: 0.04em; vertical-align: 1px;
+    }
     #builder[hidden] { display: none; }
     #bars { display: grid; grid-template-columns: repeat(16, 1fr); gap: 3px; height: 110px; margin: 6px 0; touch-action: none; }
     #bars button { margin: 0; padding: 0; height: 100%; background: #2a2a2a; position: relative; overflow: hidden; border-radius: 4px; }
     #bars button span { position: absolute; left: 0; right: 0; bottom: 0; background: linear-gradient(#ff8a1e, #ff3d6e); pointer-events: none; }
     #toyFns { margin-top: 0; }
     #playDraft { background: #6b2d78; }
+    #playDraft.live { background: #1f9d4a; }
     .saved { display: flex; flex-direction: column; gap: 6px; margin-bottom: 6px; }
     .saved-row { display: grid; grid-template-columns: 1fr auto; gap: 6px; }
     .saved-row button { margin: 0; }
@@ -2564,7 +2570,7 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
     <button type="button" id="modeTimed">For seconds</button>
     <button type="button" id="modeHold" class="secondary">Stay on</button>
   </div>
-  <p id="holdNote" class="pattern-note" hidden>The toy stays where the slider is. It stops at 0.</p>
+  <p id="holdNote" class="pattern-note" hidden>Sliders hold where you put them. A pattern stays on until you tap it again.</p>
   <label id="secondsLabel" for="duration">Seconds</label>
   <input id="duration" type="number" min="1" max="60" value="5">
   <button id="vibrate">Vibrate for those seconds</button>
@@ -2980,6 +2986,7 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
       const level = parseInt(strength.value, 10) || 0;
       strengthVal.textContent = String(level);
       desired = level;
+      if (liveKey) clearLivePattern();
       const levels = collectLevels();
       if (stayingOn()) stopClock();
       else if (levelsOn(levels)) beginSession();
@@ -3044,13 +3051,32 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
       held.className = holdOn ? "" : "secondary";
       document.getElementById("holdNote").hidden = !holdOn;
       document.getElementById("vibrate").textContent = runLabel(selectedFunctions());
+      const presetNote = document.getElementById("presetNote");
+      const mineNote = document.getElementById("mineNote");
+      if (presetNote) {
+        presetNote.textContent = holdOn
+          ? "Tap a pattern. It stays on until you tap it again."
+          : "Lovense patterns for Connect and Remote. They run for the seconds above.";
+      }
+      if (mineNote) {
+        mineNote.textContent = holdOn
+          ? "Tap one. It stays on until you tap it again."
+          : "Saved on this avatar. They stay here every time you open the controls.";
+      }
     }
 
     function chooseHold(next) {
       if (guestToken || holdOn === next) return;
+      const patternWasLive = !!liveKey;
       holdOn = next;
       try { localStorage.setItem("hhn-hold-on", holdOn ? "1" : "0"); } catch (e) {}
       paintModes();
+      if (!holdOn && patternWasLive) {
+        clearLivePattern();
+        queueSend(true);
+        status.textContent = "Pattern is off.";
+        return;
+      }
       if (holdOn) {
         stopClock();
         if (levelsOn(collectLevels())) {
@@ -3217,6 +3243,7 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
         input.setAttribute("data-fn", name);
         input.oninput = () => {
           val.textContent = input.value;
+          if (liveKey) clearLivePattern();
           const levels = collectLevels();
           if (stayingOn()) stopClock();
           else if (levelsOn(levels)) beginSession();
@@ -3231,6 +3258,7 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
     }
 
     toySelect.onchange = () => {
+      clearLivePattern();
       shownFns = "";
       strength.value = "0";
       strengthVal.textContent = "0";
@@ -3322,29 +3350,123 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
       }
     }
 
+    let liveKey = "";
+
+    function labelOf(button) {
+      const saved = button.getAttribute("data-label");
+      if (saved) return saved;
+      const label = button.textContent.trim();
+      button.setAttribute("data-label", label);
+      return label;
+    }
+
+    function paintPatternButton(button, on) {
+      const label = labelOf(button);
+      button.classList.toggle("live", !!on);
+      button.replaceChildren(document.createTextNode(label));
+      if (!on) return;
+      button.append(document.createTextNode(" "));
+      const mark = document.createElement("span");
+      mark.className = "on-word";
+      mark.textContent = "on";
+      button.append(mark);
+    }
+
+    function clearLivePattern() {
+      if (!liveKey) return;
+      liveKey = "";
+      document.querySelectorAll("button.live").forEach((button) => paintPatternButton(button, false));
+    }
+
+    function showLive(button, key) {
+      document.querySelectorAll("button.live").forEach((el) => {
+        if (el !== button) paintPatternButton(el, false);
+      });
+      liveKey = key;
+      paintPatternButton(button, true);
+    }
+
+    function silenceSlider() {
+      if (sendTimer) clearTimeout(sendTimer);
+      sendTimer = null;
+      dirty = false;
+      flightGen += 1;
+      flying = false;
+      desired = 0;
+      lastSent = 0;
+      lastLevels = "";
+      wasMulti = false;
+      clearGlide();
+      sendAt = 0;
+      strength.value = "0";
+      strengthVal.textContent = "0";
+      zeroExtras();
+    }
+
+    function stopLivePattern(label) {
+      clearLivePattern();
+      stopClock();
+      strength.value = "0";
+      strengthVal.textContent = "0";
+      zeroExtras();
+      desired = 0;
+      queueSend(true);
+      status.textContent = label + " is off.";
+    }
+
+    async function postPattern(url, body) {
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const data = await r.json();
+      if (!r.ok || data.error) throw new Error(data.error || "Pattern failed.");
+      if (guestToken) applyGrant(data);
+      return data;
+    }
+
     document.querySelectorAll("[data-pattern]").forEach((button) => {
       button.onclick = async () => {
         const name = button.getAttribute("data-pattern");
+        const label = labelOf(button);
+        const key = "preset:" + name;
+        if (stayingOn()) {
+          if (liveKey === key) {
+            stopLivePattern(label);
+            return;
+          }
+          silenceSlider();
+          stopClock();
+          showLive(button, key);
+          status.textContent = label + " is on.";
+          try {
+            await postPattern("/api/hud/pattern", withActor({
+              name,
+              duration: 0,
+              hold: true,
+              toy_id: toySelect.value || undefined
+            }));
+          } catch (e) {
+            if (liveKey === key) clearLivePattern();
+            status.textContent = e.message || "Pattern failed.";
+          }
+          return;
+        }
+        clearLivePattern();
         const seconds = Math.max(2, allowedSeconds());
         stopClock();
         zeroExtras();
         desired = 0;
         lastSent = 0;
         beginSession(true);
-        status.textContent = button.textContent + " for " + seconds + " seconds.";
+        status.textContent = label + " for " + seconds + " seconds.";
         try {
-          const r = await fetch("/api/hud/pattern", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(withActor({
-              name,
-              duration: seconds,
-              toy_id: toySelect.value || undefined
-            }))
-          });
-          const data = await r.json();
-          if (!r.ok || data.error) throw new Error(data.error || "Pattern failed.");
-          if (guestToken) applyGrant(data);
+          await postPattern("/api/hud/pattern", withActor({
+            name,
+            duration: seconds,
+            toy_id: toySelect.value || undefined
+          }));
         } catch (e) {
           status.textContent = e.message || "Pattern failed.";
         }
@@ -3387,6 +3509,7 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
       queueSend(false);
     };
     document.getElementById("stop").onclick = () => {
+      clearLivePattern();
       stopClock();
       strength.value = "0";
       strengthVal.textContent = "0";
@@ -3424,7 +3547,30 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
       }
     }
 
-    async function playCustom(label, extra) {
+    async function playCustom(label, extra, button) {
+      const key = button ? (button.id === "playDraft" ? "draft" : ("saved:" + (extra.id || label))) : "";
+      if (stayingOn() && button) {
+        if (liveKey === key) {
+          stopLivePattern(label);
+          return;
+        }
+        silenceSlider();
+        stopClock();
+        showLive(button, key);
+        status.textContent = label + " is on.";
+        try {
+          await postPattern("/api/hud/custom-pattern", Object.assign(withActor({
+            duration: 0,
+            hold: true,
+            toy_id: toySelect.value || undefined
+          }), extra));
+        } catch (e) {
+          if (liveKey === key) clearLivePattern();
+          status.textContent = e.message || "Pattern failed.";
+        }
+        return;
+      }
+      clearLivePattern();
       const seconds = Math.max(2, allowedSeconds());
       stopClock();
       zeroExtras();
@@ -3433,17 +3579,10 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
       beginSession(true);
       status.textContent = label + " for " + seconds + " seconds.";
       try {
-        const r = await fetch("/api/hud/custom-pattern", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(Object.assign(withActor({
-            duration: seconds,
-            toy_id: toySelect.value || undefined
-          }), extra))
-        });
-        const data = await r.json();
-        if (!r.ok || data.error) throw new Error(data.error || "Pattern failed.");
-        if (guestToken) applyGrant(data);
+        await postPattern("/api/hud/custom-pattern", Object.assign(withActor({
+          duration: seconds,
+          toy_id: toySelect.value || undefined
+        }), extra));
       } catch (e) {
         status.textContent = e.message || "Pattern failed.";
       }
@@ -3463,7 +3602,9 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
         const play = document.createElement("button");
         play.type = "button";
         play.textContent = row.name;
-        play.onclick = () => playCustom(row.name, { id: row.id });
+        play.setAttribute("data-label", row.name);
+        play.setAttribute("data-id", String(row.id));
+        play.onclick = () => playCustom(row.name, { id: row.id }, play);
         box.appendChild(play);
       });
     }
@@ -3488,12 +3629,16 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
           const play = document.createElement("button");
           play.type = "button";
           play.textContent = row.name;
-          play.onclick = () => playCustom(row.name, { id: row.id });
+          play.setAttribute("data-label", row.name);
+          play.setAttribute("data-id", String(row.id));
+          play.onclick = () => playCustom(row.name, { id: row.id }, play);
+          if (liveKey === "saved:" + row.id) paintPatternButton(play, true);
           const remove = document.createElement("button");
           remove.type = "button";
           remove.className = "secondary remove";
           remove.textContent = "Remove";
           remove.onclick = async () => {
+            const wasLive = liveKey === "saved:" + row.id;
             const response = await fetch("/api/hud/patterns/delete", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -3504,6 +3649,7 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
               status.textContent = result.error || "Could not remove that pattern.";
               return;
             }
+            if (wasLive) stopLivePattern(row.name);
             status.textContent = row.name + " removed.";
             loadSaved();
           };
@@ -3543,7 +3689,9 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
         return;
       }
       const label = document.getElementById("patternName").value.trim() || "Custom";
-      playCustom(label, { steps: draft.slice() });
+      const draftButton = document.getElementById("playDraft");
+      draftButton.setAttribute("data-label", "Try it");
+      playCustom(label, { steps: draft.slice() }, draftButton);
     };
     document.getElementById("savePattern").onclick = async () => {
       const name = document.getElementById("patternName").value.trim();
@@ -4255,13 +4403,18 @@ app.post('/api/hud/custom-pattern', async (req, res) => {
     }
     if (!steps) return res.status(400).json({ error: "That pattern has no beats." });
 
+    const hold = wantsHold(req.body, actor, false);
     let seconds = parseInt(req.body.duration, 10);
-    if (Number.isNaN(seconds)) seconds = 5;
-    const customCap = actor.guest ? Math.max(2, actor.secondsLeft || 60) : 60;
-    seconds = Math.max(2, Math.min(customCap, seconds));
-    const limitedCustom = limitSeconds(seconds, actor);
-    if (limitedCustom.error) return res.status(limitedCustom.status).json({ error: limitedCustom.error });
-    seconds = limitedCustom.seconds;
+    if (Number.isNaN(seconds)) seconds = hold ? 0 : 5;
+    if (hold) {
+      seconds = 0;
+    } else {
+      const customCap = actor.guest ? Math.max(2, actor.secondsLeft || 60) : 60;
+      seconds = Math.max(2, Math.min(customCap, seconds));
+      const limitedCustom = limitSeconds(seconds, actor);
+      if (limitedCustom.error) return res.status(limitedCustom.status).json({ error: limitedCustom.error });
+      seconds = limitedCustom.seconds;
+    }
     cancelFade(wearer);
 
     const commandData = await sendCustomPattern(
@@ -4269,7 +4422,7 @@ app.post('/api/hud/custom-pattern', async (req, res) => {
       session.connection,
       req.body.toy_id,
       steps,
-      seconds
+      hold ? 0 : seconds
     );
     if (!commandOk(commandData)) {
       const offline = commandData && (commandData.code === 507 || /offline/i.test(String(commandData.message || '')));
@@ -4286,7 +4439,7 @@ app.post('/api/hud/custom-pattern', async (req, res) => {
        SET vibe_strength = 10,
            vibe_until = NOW() + ($2 * INTERVAL '1 second')
        WHERE sl_uuid = $1`,
-      [wearer, seconds]
+      [wearer, hold ? HOLD_DB_SECONDS : seconds]
     );
     if (actor.guest) {
       const clock = await startGuestClock(actor, wearer);
@@ -4315,19 +4468,24 @@ app.post('/api/hud/pattern', async (req, res) => {
       return res.status(404).json({ error: "Toy is not connected or session expired. Re-link the QR." });
     }
 
+    const hold = wantsHold(req.body, actor, false);
     let seconds = parseInt(req.body.duration, 10);
-    if (Number.isNaN(seconds)) seconds = 5;
-    const presetCap = actor.guest ? Math.max(2, actor.secondsLeft || 60) : 60;
-    seconds = Math.max(2, Math.min(presetCap, seconds));
-    const limitedPreset = limitSeconds(seconds, actor);
-    if (limitedPreset.error) return res.status(limitedPreset.status).json({ error: limitedPreset.error });
-    seconds = limitedPreset.seconds;
+    if (Number.isNaN(seconds)) seconds = hold ? 0 : 5;
+    if (hold) {
+      seconds = 0;
+    } else {
+      const presetCap = actor.guest ? Math.max(2, actor.secondsLeft || 60) : 60;
+      seconds = Math.max(2, Math.min(presetCap, seconds));
+      const limitedPreset = limitSeconds(seconds, actor);
+      if (limitedPreset.error) return res.status(limitedPreset.status).json({ error: limitedPreset.error });
+      seconds = limitedPreset.seconds;
+    }
     cancelFade(wearer);
 
     const command = {
       command: 'Preset',
       name,
-      timeSec: seconds,
+      timeSec: hold ? 0 : seconds,
       apiVer: 1
     };
     if (req.body.toy_id) command.toy = req.body.toy_id;
@@ -4348,7 +4506,7 @@ app.post('/api/hud/pattern', async (req, res) => {
        SET vibe_strength = 10,
            vibe_until = NOW() + ($2 * INTERVAL '1 second')
        WHERE sl_uuid = $1`,
-      [wearer, seconds]
+      [wearer, hold ? HOLD_DB_SECONDS : seconds]
     );
     if (actor.guest) {
       const clock = await startGuestClock(actor, wearer);
