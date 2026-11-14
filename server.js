@@ -1635,6 +1635,19 @@ async function demoGate(uuid) {
   return demoView(await readDemo(uuid));
 }
 
+app.post('/api/hud/demo/open', async (req, res) => {
+  const uuid = String(req.body.sl_uuid || '');
+  if (!uuid) return res.status(400).json({ error: "Missing avatar." });
+  try {
+    const row = await readDemo(uuid);
+    if (row) return res.status(403).json({ error: "You already got a demo." });
+    return res.json({ success: true, open: true });
+  } catch (err) {
+    console.error("Demo open error:", err);
+    res.status(500).json({ error: "Could not check the demo." });
+  }
+});
+
 app.post('/api/hud/demo/claim', async (req, res) => {
   const uuid = String(req.body.sl_uuid || '');
   if (!uuid) return res.status(400).json({ error: "Missing avatar." });
