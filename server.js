@@ -134,6 +134,7 @@ async function ensureSchema() {
   await db.query(`ALTER TABLE control_grants ADD COLUMN IF NOT EXISTS hud_mode TEXT DEFAULT 'normal'`);
   await db.query(`ALTER TABLE control_grants ADD COLUMN IF NOT EXISTS running_since TIMESTAMPTZ`);
   await db.query(`ALTER TABLE control_grants ADD COLUMN IF NOT EXISTS rate INTEGER DEFAULT 30`);
+  await db.query(`ALTER TABLE control_grants ADD COLUMN IF NOT EXISTS hard_expire BOOLEAN DEFAULT FALSE`);
   await db.query(`CREATE TABLE IF NOT EXISTS control_offers (
     id TEXT PRIMARY KEY,
     wearer_uuid TEXT NOT NULL,
@@ -266,6 +267,7 @@ const FUNCTION_ALIASES = {
 const MODEL_FUNCTIONS = [
   [/solace\s*pro|solacepro/, ['Thrusting', 'Stroke', 'Position']],
   [/solace/, ['Thrusting', 'Depth']],
+  [/mission/, ['Vibrate']],
   [/nora/, ['Vibrate', 'Rotate']],
   [/max/, ['Vibrate', 'Pump']],
   [/tenera/, ['Suction']],
@@ -316,14 +318,21 @@ function listToys(connection) {
     }
   }
   if (!toys || typeof toys !== 'object') return [];
-  return Object.values(toys).map((toy) => ({
-    id: toy.id,
-    type: toy.name || 'toy',
-    name: toy.nickName || toy.name || toy.id,
-    status: toy.status,
-    battery: toyBattery(toy),
-    functions: functionsForToy(toy)
-  }));
+  const entries = Array.isArray(toys)
+    ? toys.map((toy, i) => [toy && (toy.id || toy.toyId) || String(i), toy])
+    : Object.entries(toys);
+  return entries.map(([key, toy]) => {
+    if (!toy || typeof toy !== 'object') return null;
+    const id = toy.id || toy.toyId || key;
+    return {
+      id,
+      type: toy.name || toy.toyType || 'toy',
+      name: toy.nickName || toy.nickname || toy.name || toy.toyType || id,
+      status: toy.status,
+      battery: toyBattery(toy),
+      functions: functionsForToy(toy)
+    };
+  }).filter(Boolean);
 }
 
 function displayToyName(name) {
@@ -340,41 +349,65 @@ function toyLine(toys) {
 }
 
 function toyListEntries(value) {
+  return toyListPairs(value).map(([, toy]) => toy);
+}
+
+function parseToyValue(value) {
   if (typeof value === 'string') {
-    try { return toyListEntries(JSON.parse(value)); } catch (err) { return []; }
+    try { return parseToyValue(JSON.parse(value)); } catch (err) { return null; }
   }
-  if (Array.isArray(value)) return value;
-  if (value && typeof value === 'object') return Object.values(value);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value;
+}
+
+function toyListPairs(value) {
+  if (typeof value === 'string') {
+    try { return toyListPairs(JSON.parse(value)); } catch (err) { return []; }
+  }
+  if (Array.isArray(value)) {
+    return value.map((item, i) => {
+      const toy = parseToyValue(item) || item;
+      const id = toy && (toy.id || toy.toyId);
+      return [id || ('toy' + (i + 1)), toy];
+    });
+  }
+  if (value && typeof value === 'object') {
+    return Object.entries(value).map(([key, item]) => [key, parseToyValue(item) || item]);
+  }
   return [];
 }
 
 function toysFromCallback(body) {
   if (!body || typeof body !== 'object') return null;
-  if (body.toyList != null) {
-    const map = {};
-    for (const toy of toyListEntries(body.toyList)) {
-      if (!toy || typeof toy !== 'object') continue;
-      const id = toy.id || toy.toyId;
-      if (!id) continue;
-      const battery = toyBattery(toy);
-      map[id] = {
-        id,
-        name: toy.toyType || toy.name || 'toy',
-        nickName: toy.nickname || toy.nickName || toy.name || '',
-        status: toy.connected === false || toy.status === 0 || toy.status === '0' ? 0 : 1,
-        fullFunctionNames: functionsForToy({
-          fullFunctionNames: toy.fullFunctionNames,
-          shortFunctionNames: toy.shortFunctionNames,
-          toyType: toy.toyType || toy.name
-        }),
-        functionsKnown: knownFunctions(toy.fullFunctionNames || toy.shortFunctionNames).length > 0,
-        ...(battery == null ? {} : { battery })
-      };
-    }
-    if (!Object.keys(map).length) return null;
-    return map;
+  const nested = body.data && typeof body.data === 'object' ? body.data : {};
+  const source = body.toyList != null ? body.toyList
+    : (body.toys != null ? body.toys
+      : (nested.toyList != null ? nested.toyList : nested.toys));
+  if (source == null) return null;
+  const map = {};
+  for (const [key, toy] of toyListPairs(source)) {
+    if (!toy || typeof toy !== 'object') continue;
+    const id = String(toy.id || toy.toyId || key || '').trim();
+    if (!id) continue;
+    const battery = toyBattery(toy);
+    const type = toy.toyType || toy.name || toy.type || 'toy';
+    map[id] = {
+      id,
+      name: type,
+      nickName: toy.nickname || toy.nickName || toy.name || '',
+      status: toy.connected === false || toy.status === 0 || toy.status === '0' ? 0 : 1,
+      fullFunctionNames: functionsForToy({
+        fullFunctionNames: toy.fullFunctionNames,
+        shortFunctionNames: toy.shortFunctionNames,
+        functions: toy.functions,
+        toyType: type
+      }),
+      functionsKnown: knownFunctions(toy.fullFunctionNames || toy.shortFunctionNames || toy.functions).length > 0,
+      ...(battery == null ? {} : { battery })
+    };
   }
-  return body.toys || null;
+  if (!Object.keys(map).length) return null;
+  return map;
 }
 
 function collectBatteries(value, found = []) {
@@ -503,41 +536,10 @@ async function rememberBatteries(session, toys) {
 
 const getToysAt = new Map();
 
-function toyRecord(value) {
-  if (!value) return null;
-  if (typeof value === 'string') {
-    try { return toyRecord(JSON.parse(value)); } catch (err) { return null; }
-  }
-  if (typeof value !== 'object' || Array.isArray(value)) return null;
-  return value;
-}
-
 function readReportedToys(data) {
-  const root = data && data.data && typeof data.data === 'object' ? data.data : data;
-  let payload = root && root.toys != null ? root.toys : null;
-  if (typeof payload === 'string') {
-    try { payload = JSON.parse(payload); } catch (err) { payload = null; }
-  }
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return [];
-  const toys = [];
-  for (const value of Object.values(payload)) {
-    const toy = toyRecord(value);
-    if (!toy) continue;
-    const id = toy.id || toy.toyId;
-    if (!id) continue;
-    toys.push({
-      id,
-      name: toy.nickName || toy.nickname || toy.name || id,
-      type: toy.name || toy.toyType || 'toy',
-      battery: toyBattery(toy),
-      functions: functionsForToy({
-        fullFunctionNames: toy.fullFunctionNames,
-        shortFunctionNames: toy.shortFunctionNames,
-        toyType: toy.name || toy.toyType
-      })
-    });
-  }
-  return toys;
+  const mapped = toysFromCallback(data) || toysFromCallback(data && data.data);
+  if (!mapped) return [];
+  return listToys({ toys: mapped });
 }
 
 function localLovense(session) {
@@ -545,10 +547,12 @@ function localLovense(session) {
   return Boolean(domain && String(domain).includes('127-0-0-1'));
 }
 
-function scheduleGetToys(session) {
-  if (localLovense(session)) return;
-  const uid = session.sl_uuid;
-  if (Date.now() - (getToysAt.get(uid) || 0) < 60000) return;
+function scheduleGetToys(session, force) {
+  const uid = session && session.sl_uuid;
+  if (!uid) return;
+  const hasToys = listToys(session && session.connection).length > 0;
+  const wait = force ? 0 : (hasToys ? 60000 : 8000);
+  if (Date.now() - (getToysAt.get(uid) || 0) < wait) return;
   getToysAt.set(uid, Date.now());
   sendLovenseCommand(uid, { command: 'GetToys', apiVer: 1 })
     .then(async (live) => {
@@ -847,7 +851,7 @@ function commandOk(data) {
   return data && (data.code === 200 || data.code === 0 || data.result === true);
 }
 
-function postHttpsJson(url, headers, body) {
+function postHttpsJson(url, headers, body, timeoutMs, signal) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const data = JSON.stringify(body);
@@ -857,7 +861,7 @@ function postHttpsJson(url, headers, body) {
       path: u.pathname,
       method: 'POST',
       rejectUnauthorized: false,
-      timeout: 8000,
+      timeout: timeoutMs || 1200,
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(data),
@@ -876,22 +880,42 @@ function postHttpsJson(url, headers, body) {
     });
     req.on('error', reject);
     req.on('timeout', () => req.destroy(new Error('Lovense Remote timed out')));
+    if (signal) {
+      if (signal.aborted) {
+        req.destroy(new Error('aborted'));
+        return;
+      }
+      signal.addEventListener('abort', () => req.destroy(new Error('aborted')), { once: true });
+    }
     req.write(data);
     req.end();
   });
 }
 
-async function sendLovenseCommand(uid, payload) {
-  const response = await fetch('https://api.lovense-api.com/api/lan/v2/command', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      token: LOVENSE_TOKEN,
-      uid,
-      ...payload
-    }),
-    signal: AbortSignal.timeout(4000)
-  });
+async function sendLovenseCommand(uid, payload, signal) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4000);
+  const onAbort = () => controller.abort();
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }
+  let response;
+  try {
+    response = await fetch('https://api.lovense-api.com/api/lan/v2/command', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        token: LOVENSE_TOKEN,
+        uid,
+        ...payload
+      }),
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onAbort);
+  }
   const text = await response.text();
   try {
     return JSON.parse(text);
@@ -900,25 +924,42 @@ async function sendLovenseCommand(uid, payload) {
   }
 }
 
-async function sendToyCommand(uid, connection, payload) {
+function remoteOnlyHost(domain) {
+  const host = String(domain || '');
+  if (!host || host.includes('127-0-0-1')) return true;
+  return /^(?:10|192-168|172-(?:1[6-9]|2\d|3[0-1]))-/.test(host);
+}
+
+const commandRoute = new Map();
+
+async function sendToyCommand(uid, connection, payload, signal) {
   const domain = connection && connection.domain;
   const port = connection && (connection.httpsPort || connection.wssPort);
-  if (domain && port && !String(domain).includes('127-0-0-1')) {
+  if (commandRoute.get(uid) !== 'cloud' && domain && port && !remoteOnlyHost(domain)) {
     try {
       const lan = await postHttpsJson(
         `https://${domain}:${port}/command`,
         { 'X-platform': PLATFORM_NAME },
-        payload
+        payload,
+        500,
+        signal
       );
       if (commandOk(lan)) {
+        commandRoute.set(uid, 'lan');
         return lan;
       }
+      commandRoute.set(uid, 'cloud');
       console.error('LAN command rejected:', lan);
     } catch (err) {
-      console.error('LAN command failed:', err.message);
+      if (!signal || !signal.aborted) {
+        commandRoute.set(uid, 'cloud');
+        console.error('LAN command failed:', err.message);
+      } else {
+        throw err;
+      }
     }
   }
-  return sendLovenseCommand(uid, payload);
+  return sendLovenseCommand(uid, payload, signal);
 }
 
 const fades = new Map();
@@ -987,11 +1028,11 @@ function cancelFade(uid) {
   fades.set(uid, { gen: (state?.gen || 0) + 1, at: 0, levels: null, started: 0 });
 }
 
-function functionCommand(action, seconds, toyId) {
+function functionCommand(action, seconds, toyId, indefinite) {
   const command = {
     command: 'Function',
     action,
-    timeSec: action === 'Stop' ? 0 : Math.max(1, seconds),
+    timeSec: action === 'Stop' || indefinite ? 0 : Math.max(1, seconds),
     apiVer: 1,
     stopPrevious: 1
   };
@@ -999,57 +1040,10 @@ function functionCommand(action, seconds, toyId) {
   return command;
 }
 
-const STEP_MS = 100;
-const MIN_GAP_MS = 1000;
+const SEND_GAP_MS = 0;
 
 function clampLevel(value) {
   return Math.max(0, Math.min(20, value | 0));
-}
-
-function buildGlide(from, to) {
-  const start = clampLevel(from);
-  const end = clampLevel(to);
-  if (start === end) return [end];
-  const sign = Math.sign(end - start);
-  const steps = [];
-  let level = start;
-  const add = (value) => {
-    if (steps.length < 50) steps.push(value);
-    if (steps.length < 50) steps.push(value);
-  };
-  add(level);
-  while (level !== end && steps.length < 48) {
-    level += sign;
-    add(level);
-  }
-  while (steps.length < 20) steps.push(steps[steps.length - 1]);
-  return steps;
-}
-
-function holdCommand(level, toyId) {
-  const command = {
-    command: 'Function',
-    action: `Vibrate:${clampLevel(level)}`,
-    timeSec: 0,
-    apiVer: 1,
-    stopPrevious: 1
-  };
-  if (toyId) command.toy = toyId;
-  return command;
-}
-
-function playingLevel(state) {
-  if (!state || !state.steps || !state.playStarted) return state ? clampLevel(state.at || 0) : 0;
-  const index = Math.min(state.steps.length - 1, Math.floor((Date.now() - state.playStarted) / STEP_MS));
-  return state.steps[index];
-}
-
-function glideCovers(state, target) {
-  if (!state || !state.playStarted) return false;
-  const goal = clampLevel(target);
-  if (state.flat) return state.at === goal && Date.now() < state.until;
-  if (!state.steps) return false;
-  return state.playUntil - Date.now() > 200;
 }
 
 const followers = new Map();
@@ -1058,6 +1052,7 @@ function stopFollower(uid) {
   const state = followers.get(uid);
   if (!state) return;
   state.gen += 1;
+  if (state.abort) state.abort.abort();
   if (state.timer) clearTimeout(state.timer);
   followers.delete(uid);
 }
@@ -1076,25 +1071,17 @@ function ensureFollower(uid) {
       playUntil: 0,
       steps: null,
       flat: false,
+      hold: false,
       busy: false,
+      seq: 0,
+      sending: null,
+      abort: null,
       timer: null,
       lastResult: { code: 200, result: true }
     };
     followers.set(uid, state);
   }
   return state;
-}
-
-async function sendPattern(uid, connection, toyId, steps, timeSec) {
-  const pattern = {
-    command: 'Pattern',
-    rule: 'V:1;F:v;S:100#',
-    strength: steps.join(';'),
-    timeSec,
-    apiVer: 2
-  };
-  if (toyId) pattern.toy = toyId;
-  return sendToyCommand(uid, connection, pattern);
 }
 
 async function sendCustomPattern(uid, connection, toyId, steps, timeSec) {
@@ -1122,7 +1109,7 @@ function schedulePlan(uid, delay) {
   state.timer = setTimeout(() => {
     state.timer = null;
     state.timerWait = null;
-    planLevel(uid).catch((err) => console.error('Slider glide failed:', err.message));
+    planLevel(uid).catch((err) => console.error('Slider command failed:', err.message));
   }, wait);
 }
 
@@ -1135,119 +1122,85 @@ async function planLevel(uid) {
     state.timerWait = null;
   }
   const target = clampLevel(state.target);
-  if (Date.now() >= state.until && target !== 0) return;
+  const holding = !!(state.hold && target !== 0);
+  if (!holding && Date.now() >= state.until && target !== 0) return;
   if (Date.now() < state.nextSendAt) {
     schedulePlan(uid, state.nextSendAt - Date.now());
     return;
   }
-  if (glideCovers(state, target)) {
-    const wait = state.flat
-      ? Math.max(400, state.until - Date.now())
-      : Math.max(200, state.playUntil - Date.now() - 200);
-    schedulePlan(uid, wait);
-    return;
-  }
+  if (state.flat && state.at === target && (target === 0 || holding || Date.now() < state.until)) return;
 
-  const from = playingLevel(state);
-  if (from === target) {
-    if (target === 0) {
-      if (!state.flat && !state.steps) return;
-      const gen = state.gen;
-      state.busy = true;
-      try {
-        const result = await sendToyCommand(uid, state.connection, functionCommand('Stop', 0, state.toyId));
-        state.lastResult = result;
-        if (!followers.get(uid) || state.gen !== gen) return;
-        state.steps = null;
-        state.flat = false;
-        state.at = 0;
-        state.sentAt = Date.now();
-        state.playStarted = 0;
-        state.playUntil = 0;
-      } catch (err) {
-        console.error('Slider stop failed:', err.message);
-        state.lastResult = { code: 500, message: err.message };
-      } finally {
-        const current = followers.get(uid);
-        if (current && current.gen === gen) current.busy = false;
-      }
-      return;
-    }
-    if (state.flat && state.at === target) return;
-    const gen = state.gen;
-    state.busy = true;
-    try {
-      const result = await sendToyCommand(uid, state.connection, holdCommand(target, state.toyId));
-      state.lastResult = result;
-      if (!followers.get(uid) || state.gen !== gen) return;
-      if (!commandOk(result)) {
-        console.error('Slider hold rejected:', result && result.code, result && result.message);
-        state.nextSendAt = Date.now() + 1000;
-        return;
-      }
-      const started = Date.now();
-      state.flat = true;
-      state.steps = null;
-      state.at = target;
-      state.sentAt = started;
-      state.playStarted = started;
-      state.playUntil = state.until;
-      state.nextSendAt = started;
-    } catch (err) {
-      console.error('Slider hold failed:', err.message);
-      state.lastResult = { code: 500, message: err.message };
-      state.nextSendAt = Date.now() + 1000;
-    } finally {
-      const current = followers.get(uid);
-      if (current && current.gen === gen) current.busy = false;
-    }
-    return;
-  }
-
-  const steps = buildGlide(from, target);
-  const timeSec = Number((steps.length * 0.1).toFixed(1));
   const gen = state.gen;
+  const sentSeq = state.seq;
   state.busy = true;
+  state.sending = target;
+  if (state.abort) state.abort.abort();
+  const abort = new AbortController();
+  state.abort = abort;
   try {
-    const result = await sendPattern(uid, state.connection, state.toyId, steps, timeSec);
+    const seconds = holding ? 0 : Math.max(1, Math.ceil((state.until - Date.now()) / 1000));
+    const command = target === 0
+      ? functionCommand('Stop', 0, state.toyId)
+      : functionCommand(`Vibrate:${target}`, seconds, state.toyId, holding);
+    const result = await sendToyCommand(uid, state.connection, command, abort.signal);
     state.lastResult = result;
     if (!followers.get(uid) || state.gen !== gen) return;
+    if (state.seq !== sentSeq || clampLevel(state.target) !== target) {
+      state.flat = false;
+      return;
+    }
     if (!commandOk(result)) {
-      console.error('Slider pattern rejected:', result && result.code, result && result.message);
-      state.nextSendAt = Date.now() + 1000;
+      console.error('Slider command rejected:', result && result.code, result && result.message);
+      state.nextSendAt = Date.now() + 200;
       return;
     }
     const started = Date.now();
-    state.steps = steps;
-    state.flat = false;
-    state.at = from;
+    state.flat = true;
+    state.steps = null;
+    state.at = target;
     state.sentAt = started;
     state.playStarted = started;
-    state.playUntil = started + timeSec * 1000;
-    state.nextSendAt = state.playUntil - 200;
+    state.playUntil = target === 0 ? 0 : state.until;
+    state.nextSendAt = started + SEND_GAP_MS;
   } catch (err) {
-    console.error('Slider pattern failed:', err.message);
-    state.lastResult = { code: 500, message: err.message };
-    state.nextSendAt = Date.now() + 1000;
+    const aborted = abort.signal.aborted || err.name === 'AbortError' || err.message === 'aborted';
+    if (!aborted) {
+      console.error('Slider command failed:', err.message);
+      state.lastResult = { code: 500, message: err.message };
+      state.nextSendAt = Date.now() + 200;
+    }
+    state.flat = false;
   } finally {
     const current = followers.get(uid);
     if (current && current.gen === gen) {
       current.busy = false;
-      if (!current.flat && current.steps && (Date.now() < current.until || clampLevel(current.target) === 0)) {
-        schedulePlan(uid, Math.max(200, current.playUntil - Date.now() - 200));
+      if (clampLevel(current.target) !== current.at && (current.hold || Date.now() < current.until || clampLevel(current.target) === 0)) {
+        schedulePlan(uid, Math.max(0, current.nextSendAt - Date.now()));
       }
     }
   }
 }
 
-async function sendSmoothLevel(uid, connection, toyId, target, seconds) {
+async function sendSmoothLevel(uid, connection, toyId, target, seconds, hold, seq) {
   const state = ensureFollower(uid);
+  if (seq && state.seq && seq < state.seq) return state.lastResult || { code: 200, result: true };
   state.connection = connection;
   state.toyId = toyId || state.toyId;
+  if (seq) state.seq = seq;
   state.target = clampLevel(target);
-  state.until = Date.now() + Math.max(1, seconds) * 1000;
-  if (state.busy || Date.now() < state.nextSendAt || glideCovers(state, state.target)) {
-    schedulePlan(uid, state.busy ? 0 : Math.max(0, state.nextSendAt - Date.now()));
+  state.hold = !!hold && state.target !== 0;
+  state.until = state.hold
+    ? Number.POSITIVE_INFINITY
+    : Date.now() + Math.max(1, seconds) * 1000;
+  if (state.busy) {
+    if (state.target === 0 && state.abort) state.abort.abort();
+    return state.lastResult || { code: 200, result: true };
+  }
+  if (state.flat && state.at === state.target && (state.target === 0 || state.hold || Date.now() < state.until)) {
+    return state.lastResult || { code: 200, result: true };
+  }
+  if (Date.now() < state.nextSendAt) {
+    schedulePlan(uid, state.nextSendAt - Date.now());
     return state.lastResult || { code: 200, result: true };
   }
   await planLevel(uid);
@@ -1359,14 +1312,25 @@ async function beginGrantRun(token) {
 async function startGuestClock(actor, wearer) {
   const run = await beginGrantRun(actor.token);
   if (!run) return null;
-  armGuestStop(wearer, actor.token, run.secondsLeft);
-  return { seconds_left: run.secondsLeft, running: true };
+  const secondsLeft = Math.min(run.secondsLeft, actor.secondsLeft || run.secondsLeft);
+  if (secondsLeft <= 1) return null;
+  armGuestStop(wearer, actor.token, secondsLeft);
+  return { seconds_left: secondsLeft, running: true };
 }
 
 async function stopGuestClock(actor, wearer) {
   clearGuestStop(wearer);
   const left = await pauseGrant(actor.token);
   return { seconds_left: left, running: false };
+}
+
+const releasedAt = new Map();
+
+function releaseOwnerTakeover(wearer) {
+  const now = Date.now();
+  if (now - (releasedAt.get(wearer) || 0) < 5000) return;
+  releasedAt.set(wearer, now);
+  releaseGuestRun(wearer).catch((err) => console.error('Release guest run failed:', err.message));
 }
 
 async function releaseGuestRun(wearer) {
@@ -1388,12 +1352,16 @@ async function resolveControl(body) {
   if (token) {
     if (!token || token.length > 80) return { error: "This control link is not valid.", status: 404 };
     const result = await db.query(
-      `SELECT wearer_uuid, expires_at, sender_name, seconds_left, running_since, hud_mode, rate FROM control_grants WHERE token = $1`,
+      `SELECT wearer_uuid, expires_at, sender_name, seconds_left, running_since, hud_mode, rate, hard_expire FROM control_grants WHERE token = $1`,
       [token]
     );
     if (!result.rows.length) return { error: "This control link is not valid.", status: 404 };
     const row = result.rows[0];
-    const secondsLeft = grantRemaining(row);
+    let secondsLeft = grantRemaining(row);
+    if (row.hard_expire) {
+      const wall = Math.floor((new Date(row.expires_at).getTime() - Date.now()) / 1000);
+      secondsLeft = Math.min(secondsLeft, Math.max(0, wall));
+    }
     if (secondsLeft <= 0) {
       if (row.running_since) {
         await db.query(
@@ -1488,6 +1456,32 @@ function limitSeconds(seconds, actor) {
   return { seconds: Math.min(seconds, left) };
 }
 
+const HOLD_DB_SECONDS = 365 * 24 * 60 * 60;
+
+function wantsHold(body, actor, stopping) {
+  if (!body || actor.guest || stopping) return false;
+  return body.hold === true || body.hold === 'true' || body.hold === 1;
+}
+
+const linkCache = new Map();
+
+function forgetLink(uid) {
+  linkCache.delete(uid);
+  commandRoute.delete(uid);
+}
+
+async function linkForCommand(uid) {
+  const hit = linkCache.get(uid);
+  if (hit && hit.session && hit.session.status === 'connected' && hit.session.connection && Date.now() - hit.at < 20000) {
+    return hit.session;
+  }
+  const session = await getSession(uid);
+  if (session && session.status === 'connected' && session.connection) {
+    linkCache.set(uid, { at: Date.now(), session });
+  }
+  return session;
+}
+
 async function getSession(slUuid) {
   const result = await db.query(
     `SELECT sl_uuid, sl_http_url, status, toys, display_name, shared, vibe_strength, vibe_until, hud_mode
@@ -1531,13 +1525,13 @@ app.post('/api/hud/register', async (req, res) => {
        VALUES ($1, $2, 'pending', $3, $4, false, NOW())
        ON CONFLICT (sl_uuid) DO UPDATE SET
          sl_http_url = $2,
-         status = 'pending',
+         status = CASE WHEN active_sessions.status = 'connected' THEN 'connected' ELSE 'pending' END,
          lovense_token = $3,
          display_name = $4,
-         toys = NULL,
-         shared = false,
-         vibe_strength = 0,
-         vibe_until = NOW()`,
+         toys = CASE WHEN active_sessions.status = 'connected' THEN active_sessions.toys ELSE NULL END,
+         shared = CASE WHEN active_sessions.status = 'connected' THEN active_sessions.shared ELSE false END,
+         vibe_strength = CASE WHEN active_sessions.status = 'connected' THEN active_sessions.vibe_strength ELSE 0 END,
+         vibe_until = CASE WHEN active_sessions.status = 'connected' THEN active_sessions.vibe_until ELSE NOW() END`,
       [sl_uuid, sl_http_url, utoken, sl_name || sl_uuid]
     );
 
@@ -1787,10 +1781,11 @@ app.post('/api/hud/grant', async (req, res) => {
     const senderName = sentName || String(session.display_name || '').trim();
     const mode = hudMode(req.body.mode || session.hud_mode);
     const token = crypto.randomBytes(18).toString('hex');
+    const hardExpire = req.body.hard_expire === true || String(req.body.hard_expire || '') === '1' || String(req.body.hard_expire || '') === 'true';
     await db.query(
-      `INSERT INTO control_grants (token, wearer_uuid, recipient_uuid, recipient_name, sender_name, seconds_left, hud_mode, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() + ($8 * INTERVAL '1 minute'))`,
-      [token, wearer, recipient, recipientName, senderName || null, minutes * 60, mode, minutes]
+      `INSERT INTO control_grants (token, wearer_uuid, recipient_uuid, recipient_name, sender_name, seconds_left, hud_mode, expires_at, hard_expire)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() + ($8 * INTERVAL '1 minute'), $9)`,
+      [token, wearer, recipient, recipientName, senderName || null, minutes * 60, mode, minutes, hardExpire]
     );
     if (senderName) {
       await db.query(
@@ -2364,7 +2359,7 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
   <style>
     body { font-family: sans-serif; background: #111; color: #eee; max-width: 420px; margin: 0 auto; padding: 24px; }
     .brand { display: flex; align-items: center; gap: 14px; margin: 0 0 8px; }
-    .brand > img { width: 92px; height: 92px; border-radius: 50%; object-fit: cover; flex: none; box-shadow: 0 0 0 2px #f5b942; }
+    .brand > img { width: 148px; height: 148px; border-radius: 50%; object-fit: cover; flex: none; box-shadow: 0 0 0 2px #f5b942; }
     .brand h1 {
       margin: 0;
       font-family: "Pacifico", cursive;
@@ -2384,6 +2379,8 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
     h2 { font-size: 13px; margin: 12px 0 2px; }
     .pattern-note { margin: 0 0 6px; color: #ccc; font-size: 12px; }
     .patterns { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .mode-row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 8px 0 4px; }
+    .mode-row button { margin: 0; }
     .add-custom { display: grid; grid-template-columns: 1fr auto; gap: 6px; margin-top: 6px; }
     .add-custom input, .add-custom button { margin: 0; }
     .patterns button { margin: 0; background: #6b2d78; }
@@ -2406,17 +2403,17 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
     body.hooker .sender { color: #ff5a7a; letter-spacing: 0.04em; text-transform: uppercase; }
     body.hooker #grantLine, body.hooker .pattern-note { color: #ffc1cf; }
     body.hooker #status { color: #ffd0dc; }
-    body.hooker .brand { position: relative; min-height: 118px; padding-right: 132px; }
+    body.hooker .brand { position: relative; min-height: 160px; padding-right: 132px; }
     body.hooker .brand > img, body.hooker .brand h1 { position: relative; z-index: 1; }
     body.hooker .ready-script {
-      position: absolute; z-index: 2; left: 188px; top: 50%; margin: 0;
+      position: absolute; z-index: 2; left: 244px; top: 50%; margin: 0;
       transform: translateY(-54%) rotate(-8deg);
       font-family: "Great Vibes", cursive; font-size: 30px; line-height: 1; font-weight: 400;
       white-space: nowrap; pointer-events: none; color: #fff6fb;
       text-shadow: 0 0 6px #ff4da6, 0 0 16px #ff2a78, 0 0 28px #ff4df0, 0 2px 0 #4a0018;
     }
     body.hooker .neon-sign {
-      position: absolute; z-index: 0; top: 108px; right: -28px; width: 210px; margin: 0;
+      position: absolute; z-index: 0; top: 164px; right: -28px; width: 210px; margin: 0;
       pointer-events: none;
     }
     body.hooker .neon-sign video {
@@ -2432,12 +2429,12 @@ function sendControlPage(res, slUuid, guestToken, guestEnds, ownerName, grantSec
       display: flex; align-items: center; justify-content: center; padding: 24px; text-align: center;
     }
     .age-card { width: min(320px, 100%); }
-    .age-card img.logo { width: 200px; height: 200px; border-radius: 50%; object-fit: cover; display: block; margin: 0 auto 8px; }
     .age-card h2 {
       margin: 0 0 10px; font-family: "Pacifico", cursive; font-size: 32px; font-weight: 400;
       background: linear-gradient(100deg, #ffe08a, #ff8a1e 40%, #ff3d6e 75%, #ff4df0);
       -webkit-background-clip: text; background-clip: text; color: transparent;
     }
+    .age-card img.logo { width: 200px; height: 200px; border-radius: 50%; object-fit: cover; display: block; margin: 0 auto 8px; }
     .age-card p { font-size: 16px; color: #ffe8ee; margin: 0 0 16px; }
     .age-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     .age-actions button { margin: 0; }
@@ -2454,7 +2451,7 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
     ${guestToken && pageMode === 'hooker' ? hookerNeonSign() : ""}
   </header>
   <p id="senderName" class="sender"${ownerName ? "" : " hidden"}></p>
-  <p id="intro">Move the slider. The motor stays on and the strength eases while you drag.</p>
+  <p id="intro">Move the slider. The toy follows it.</p>
   <button type="button" id="hudMode" class="secondary">Normal HUD</button>
   <p id="grantLine" class="pattern-note"></p>
   <p id="addTime" class="pattern-note" hidden></p>
@@ -2469,6 +2466,11 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
   <label id="strengthLabel" for="strength">Vibration 0–100: <span id="strengthVal">0</span></label>
   <input id="strength" type="range" min="0" max="100" step="1" value="0">
   <div id="extraControls"></div>
+  <div id="powerMode" class="mode-row">
+    <button type="button" id="modeTimed">For seconds</button>
+    <button type="button" id="modeHold" class="secondary">Stay on</button>
+  </div>
+  <p id="holdNote" class="pattern-note" hidden>The toy stays where the slider is. It stops at 0.</p>
   <label id="secondsLabel" for="duration">Seconds</label>
   <input id="duration" type="number" min="1" max="60" value="5">
   <button id="vibrate">Vibrate for those seconds</button>
@@ -2512,6 +2514,14 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
     const pageMode = ${JSON.stringify(pageMode || "normal")};
     const payRate = ${Math.max(1, Number(payRate) || 30)};
     let sentMode = "normal";
+    let holdOn = false;
+    try {
+      if (!guestToken && localStorage.getItem("hhn-hold-on") === "1") holdOn = true;
+    } catch (e) {}
+
+    function stayingOn() {
+      return holdOn && !guestToken;
+    }
 
     function withActor(body) {
       if (guestToken) body.grant_token = guestToken;
@@ -2532,6 +2542,12 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
     let clock = null;
     let sendTimer = null;
     let sendImmediate = false;
+    let flightGen = 0;
+    let flying = false;
+    let dirty = false;
+    let commandSeq = 0;
+    let localWorks = null;
+    let localChain = Promise.resolve();
     let localCommand = "";
     let loadedToys = [];
     let shownFns = "";
@@ -2555,46 +2571,115 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
       return Math.max(0, Math.ceil((endsAt - Date.now()) / 1000));
     }
 
-    function queueSend(immediateStop) {
-      if (immediateStop) {
-        if (sendTimer) clearTimeout(sendTimer);
-        sendTimer = null;
-        sendImmediate = false;
-        desired = 0;
-        lastSent = 0;
-        lastLevels = "";
-        wasMulti = false;
-        postCommand(commandBody(0, 0, true)).catch((e) => {
-          lastSent = -1;
-          status.textContent = e.message || "Command failed.";
-        });
-        status.textContent = "Stopped.";
-        return;
+    function localScale(name, percent) {
+      const max = name === "Pump" || name === "Depth" ? 3 : (name === "Stroke" || name === "Position" ? 100 : 20);
+      const p = Math.max(0, Math.min(100, percent | 0));
+      if (p <= 0) return 0;
+      if (max === 100) return p;
+      return Math.max(1, Math.round((p * max) / 100));
+    }
+
+    function localPayload(levels, seconds, holding, stop) {
+      if (stop) {
+        return { command: "Function", action: "Stop", timeSec: 0, apiVer: 1, stopPrevious: 1 };
       }
-      if (sendTimer) return;
-      sendTimer = setTimeout(() => {
-        sendTimer = null;
-        const levels = collectLevels();
-        if (multiOn(levels)) {
-          const left = remaining();
-          if (left <= 0) return;
-          const signature = JSON.stringify(levels) + "|" + (toySelect.value || "");
-          if (signature === lastLevels) return;
-          lastLevels = signature;
-          wasMulti = true;
-          lastSent = -1;
-          postCommand(withActor({
-            levels: levels,
-            duration: left,
-            stop: false,
-            toy_id: toySelect.value || undefined
-          })).catch((e) => {
-            lastLevels = "";
-            status.textContent = e.message || "Command failed.";
+      if ((levels.Position || 0) > 0 || (levels.Stroke || 0) > 0) return null;
+      const order = ["Vibrate", "Vibrate1", "Vibrate2", "Vibrate3", "Rotate", "Pump", "Thrusting", "Fingering", "Suction", "Depth", "Oscillate"];
+      const parts = [];
+      order.forEach((name) => {
+        const level = localScale(name, levels[name] || 0);
+        if (level > 0) parts.push(name + ":" + level);
+      });
+      if (!parts.length) {
+        return { command: "Function", action: "Stop", timeSec: 0, apiVer: 1, stopPrevious: 1 };
+      }
+      const payload = {
+        command: "Function",
+        action: parts.join(","),
+        timeSec: holding ? 0 : Math.max(1, seconds),
+        apiVer: 1,
+        stopPrevious: 1
+      };
+      if (toySelect.value) payload.toy = toySelect.value;
+      return payload;
+    }
+
+    function pushLocal(payload) {
+      if (!payload || localWorks === false) return Promise.resolve(false);
+      const run = localChain.then(() => raceLocal(payload));
+      localChain = run.then(() => {}, () => {});
+      return run;
+    }
+
+    function raceLocal(payload) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), localWorks ? 250 : 120);
+      const urls = ["https://127-0-0-1.lovense.club:30010/command"];
+      if (localCommand && urls.indexOf(localCommand) < 0) urls.push(localCommand);
+      const jobs = urls.map((url) => fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-platform": "HotHawaiianNights" },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      }).then((r) => r.json()).then((data) => !!(data && (data.code === 200 || data.code === 0 || data.result === true))).catch(() => false));
+      return new Promise((resolve) => {
+        let pending = jobs.length;
+        let settled = false;
+        jobs.forEach((job) => {
+          job.then((ok) => {
+            if (ok && !settled) {
+              settled = true;
+              localWorks = true;
+              resolve(true);
+            }
+          }).finally(() => {
+            pending -= 1;
+            if (!pending && !settled) {
+              if (localWorks !== true) localWorks = false;
+              resolve(false);
+            }
           });
-          status.textContent = "Controls sent.";
-          return;
-        }
+        });
+      }).finally(() => {
+        clearTimeout(timer);
+        controller.abort();
+      });
+    }
+
+    function finishFlight(gen) {
+      if (gen !== flightGen) return;
+      flying = false;
+      if (!dirty) return;
+      dirty = false;
+      sendSlider(gen, false);
+    }
+
+    function sendSlider(gen, immediateStop) {
+      if (gen !== flightGen) return;
+      flying = true;
+      const levels = immediateStop ? { Vibrate: 0 } : collectLevels();
+      const holding = stayingOn();
+      let body;
+      let seconds = 0;
+      if (immediateStop) {
+        body = commandBody(0, 0, true, false);
+      } else if (multiOn(levels)) {
+        seconds = holding ? 0 : remaining();
+        if (!holding && seconds <= 0) return finishFlight(gen);
+        const signature = JSON.stringify(levels) + "|" + (toySelect.value || "") + "|" + (holding ? "h" : "t");
+        if (signature === lastLevels) return finishFlight(gen);
+        lastLevels = signature;
+        wasMulti = true;
+        lastSent = -1;
+        body = withActor({
+          levels: levels,
+          duration: seconds,
+          hold: holding,
+          stop: false,
+          toy_id: toySelect.value || undefined
+        });
+        status.textContent = holding ? "On until the slider is 0." : "Controls sent.";
+      } else {
         if (wasMulti) {
           wasMulti = false;
           lastSent = -1;
@@ -2602,20 +2687,58 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
         }
         const level = desired;
         const step = toyStep(level);
-        const left = level === 0 ? 0 : remaining();
-        if (level > 0 && left <= 0) return;
-        if (step !== lastSent) {
-          lastSent = step;
-          postCommand(commandBody(level, left, false)).catch((e) => {
-            lastSent = -1;
-            status.textContent = e.message || "Command failed.";
-          });
-          status.textContent = level === 0
-            ? "Easing off."
-            : ("Strength " + level + " of 100");
+        seconds = holding || level === 0 ? 0 : remaining();
+        if (!holding && level > 0 && seconds <= 0) return finishFlight(gen);
+        if (step === lastSent) return finishFlight(gen);
+        lastSent = step;
+        body = commandBody(level, seconds, false, holding && level > 0);
+        status.textContent = level === 0
+          ? "Off."
+          : (holding ? ("On at " + level + ". It stops at 0.") : ("Strength " + level + " of 100"));
+      }
+      body.seq = ++commandSeq;
+      const payload = localPayload(levels, seconds, holding && !immediateStop, immediateStop || !levelsOn(levels));
+      pushLocal(payload).then(async (delivered) => {
+        if (gen !== flightGen) return;
+        body.delivered = !!delivered;
+        if (delivered && !immediateStop) {
+          postCommand(body).catch(() => {});
+          return;
         }
-        if (toyStep(desired) !== lastSent) queueSend(false);
-      }, lastSent < 0 ? 0 : 150);
+        await postCommand(body);
+      }).catch((e) => {
+        if (gen !== flightGen || body.delivered) return;
+        lastSent = -1;
+        lastLevels = "";
+        status.textContent = e.message || "Command failed.";
+      }).finally(() => finishFlight(gen));
+    }
+
+    function queueSend(immediateStop) {
+      if (immediateStop) {
+        if (sendTimer) clearTimeout(sendTimer);
+        sendTimer = null;
+        sendImmediate = false;
+        dirty = false;
+        flightGen += 1;
+        desired = 0;
+        lastSent = 0;
+        lastLevels = "";
+        wasMulti = false;
+        status.textContent = "Stopped.";
+        sendSlider(flightGen, true);
+        return;
+      }
+      if (flying) {
+        dirty = true;
+        return;
+      }
+      if (sendTimer) return;
+      const gen = flightGen;
+      sendTimer = setTimeout(() => {
+        sendTimer = null;
+        sendSlider(gen, false);
+      }, 0);
     }
 
     strength.oninput = () => {
@@ -2623,7 +2746,8 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
       strengthVal.textContent = String(level);
       desired = level;
       const levels = collectLevels();
-      if (levelsOn(levels)) beginSession();
+      if (stayingOn()) stopClock();
+      else if (levelsOn(levels)) beginSession();
       else stopClock();
       queueSend(false);
     };
@@ -2667,13 +2791,48 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
       return data;
     }
 
-    function commandBody(level, seconds, immediateStop) {
+    function commandBody(level, seconds, immediateStop, holding) {
       return withActor({
         strength: level,
         duration: seconds,
+        hold: !!holding,
         stop: !!immediateStop,
         toy_id: toySelect.value || undefined
       });
+    }
+
+    function paintModes() {
+      const timed = document.getElementById("modeTimed");
+      const held = document.getElementById("modeHold");
+      if (!timed || !held) return;
+      timed.className = holdOn ? "secondary" : "";
+      held.className = holdOn ? "" : "secondary";
+      document.getElementById("holdNote").hidden = !holdOn;
+      document.getElementById("vibrate").textContent = runLabel(selectedFunctions());
+    }
+
+    function chooseHold(next) {
+      if (guestToken || holdOn === next) return;
+      holdOn = next;
+      try { localStorage.setItem("hhn-hold-on", holdOn ? "1" : "0"); } catch (e) {}
+      paintModes();
+      if (holdOn) {
+        stopClock();
+        if (levelsOn(collectLevels())) {
+          lastSent = -1;
+          lastLevels = "";
+          queueSend(false);
+        } else {
+          status.textContent = "Move the slider. It stays on until you set it to 0.";
+        }
+        return;
+      }
+      if (levelsOn(collectLevels())) {
+        lastSent = -1;
+        lastLevels = "";
+        beginSession(true);
+        queueSend(false);
+      }
     }
 
     function toyLabel(toy) {
@@ -2773,6 +2932,9 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
 
     function runLabel(names) {
       if (guestToken && pageMode === "hooker") return "Work it";
+      if (stayingOn()) {
+        return names.length === 1 && names[0] === "Vibrate" ? "Hold this level" : "Hold these levels";
+      }
       if (names.length === 1 && names[0] === "Vibrate") {
         return guestToken ? "Vibrate" : "Vibrate for those seconds";
       }
@@ -2821,7 +2983,8 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
         input.oninput = () => {
           val.textContent = input.value;
           const levels = collectLevels();
-          if (levelsOn(levels)) beginSession();
+          if (stayingOn()) stopClock();
+          else if (levelsOn(levels)) beginSession();
           else stopClock();
           queueSend(false);
         };
@@ -2912,10 +3075,12 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
         }         else {
           const names = selectedFunctions();
           status.textContent = (data.toys && data.toys.length)
-            ? (names.length > 1
-              ? "Each slider is one of this toy's controls."
-              : "Move the slider. Power follows while you drag.")
-            : "No toys reported yet. Keep Lovense Connect open and refresh.";
+            ? (stayingOn()
+              ? "Move the slider. It stays on until you set it to 0."
+              : (names.length > 1
+                ? "Each slider is one of this toy's controls."
+                : "Move the slider. Power follows while you drag."))
+            : "No toys reported yet. Keep Lovense Remote open and refresh.";
         }
       } catch (e) {
         status.textContent = "Failed to load toys.";
@@ -2955,6 +3120,14 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
       const levels = collectLevels();
       if (!levelsOn(levels)) {
         status.textContent = "Move a slider above 0 first.";
+        return;
+      }
+      if (stayingOn()) {
+        stopClock();
+        desired = levels.Vibrate || 0;
+        lastSent = -1;
+        lastLevels = "";
+        queueSend(false);
         return;
       }
       stopClock();
@@ -3266,6 +3439,8 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
       document.getElementById("presetNote").textContent = "Lovense patterns for Connect and Remote.";
       document.getElementById("secondsLabel").hidden = true;
       document.getElementById("duration").hidden = true;
+      document.getElementById("powerMode").hidden = true;
+      document.getElementById("holdNote").hidden = true;
       document.getElementById("vibrate").textContent = "Vibrate";
       document.getElementById("disconnect").hidden = true;
       document.getElementById("makePattern").hidden = true;
@@ -3394,6 +3569,11 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
         })
         .catch(() => {});
     }
+    if (!guestToken) {
+      document.getElementById("modeTimed").onclick = () => chooseHold(false);
+      document.getElementById("modeHold").onclick = () => chooseHold(true);
+      paintModes();
+    }
     loadToys().then(() => { if (!guestToken) readBattery(); });
     if (!guestToken) loadSaved();
     setInterval(() => {
@@ -3429,7 +3609,22 @@ ${guestToken && pageMode === 'hooker' ? '<script>try{if(sessionStorage.getItem("
       }
       fetch("/api/hud/status/" + encodeURIComponent(uuid))
         .then((r) => r.json())
-        .then((data) => { if (data && data.toys) showToys(data.toys); })
+        .then((data) => {
+          if (!data) return;
+          if (data.connected && data.toys && data.toys.length) {
+            showToys(data.toys);
+            if (/not connected|No toys|Could not load|Failed to load/i.test(status.textContent || "")) {
+              const names = selectedFunctions();
+              status.textContent = stayingOn()
+                ? "Move the slider. It stays on until you set it to 0."
+                : (names.length > 1
+                  ? "Each slider is one of this toy's controls."
+                  : "Move the slider. Power follows while you drag.");
+            }
+            return;
+          }
+          if (!loadedToys.length) loadToys();
+        })
         .catch(() => {});
     }, 5000);
   </script>
@@ -3561,7 +3756,7 @@ app.post('/api/webhook/lovense', async (req, res) => {
       return res.sendStatus(200);
     }
     if (utoken && session.lovense_token && utoken !== session.lovense_token) {
-      return res.status(403).send("utoken mismatch.");
+      console.log('Lovense utoken changed for', uid);
     }
 
     const previous = parseConnection(session.toys);
@@ -3588,10 +3783,17 @@ app.post('/api/webhook/lovense', async (req, res) => {
 
     await db.query(
       `UPDATE active_sessions
-       SET status = 'connected', toys = $1
+       SET status = 'connected', toys = $1, lovense_token = COALESCE($3, lovense_token)
        WHERE sl_uuid = $2`,
-      [JSON.stringify(connection), uid]
+      [JSON.stringify(connection), uid, utoken || null]
     );
+
+    getToysAt.delete(uid);
+    linkCache.set(uid, {
+      at: Date.now(),
+      session: { ...session, status: 'connected', connection }
+    });
+    scheduleGetToys({ sl_uuid: uid, status: 'connected', connection }, true);
 
     if (session.sl_http_url && session.status !== 'connected') {
       await fetch(session.sl_http_url, {
@@ -3628,6 +3830,7 @@ app.post('/api/hud/disconnect', async (req, res) => {
     }
 
     stopBatteryWatch(slUuid);
+    forgetLink(slUuid);
     if (session.status === 'connected' && session.connection) {
       cancelFade(slUuid);
       try {
@@ -3934,10 +4137,12 @@ app.post('/api/hud/vibrate', async (req, res) => {
   if (actor.error) return res.status(actor.status).json({ error: actor.error });
   const wearer_uuid = actor.wearer;
   const { strength, duration, toy_id, stop } = req.body;
-  if (!actor.guest) await releaseGuestRun(wearer_uuid);
+  const seq = parseInt(req.body.seq, 10) || 0;
+  const delivered = req.body.delivered === true || req.body.delivered === 'true';
+  if (!actor.guest) releaseOwnerTakeover(wearer_uuid);
 
   try {
-    const session = await getSession(wearer_uuid);
+    const session = await linkForCommand(wearer_uuid);
     if (!session || session.status !== 'connected') {
       return res.status(404).json({ error: "Toy is not connected or session expired. Re-link the QR." });
     }
@@ -3947,17 +4152,31 @@ app.post('/api/hud/vibrate', async (req, res) => {
       let seconds = parseInt(duration, 10);
       if (Number.isNaN(seconds)) seconds = 0;
       const vibeCap = actor.guest ? Math.max(1, actor.secondsLeft || 60) : 60;
-      seconds = Math.max(0, Math.min(vibeCap, seconds));
       const built = levelsToCommand(levelMap);
       const stopNow = stop === true || stop === 'true' || (!built.action && !built.position);
+      const hold = wantsHold(req.body, actor, stopNow);
+      if (!hold) seconds = Math.max(0, Math.min(vibeCap, seconds));
       if (actor.guest && !stopNow) {
         const limited = limitSeconds(Math.max(1, seconds), actor);
         if (limited.error) return res.status(limited.status).json({ error: limited.error });
         seconds = limited.seconds;
       }
-      cancelFade(wearer_uuid);
+      const seen = ensureFollower(wearer_uuid);
+      if (seq && seen.seq && seq < seen.seq) {
+        return res.json({ success: true, ignored: true });
+      }
+      if (seq) seen.seq = seq;
       let commandData;
-      if (stopNow) {
+      if (delivered && !stopNow) {
+        seen.connection = session.connection;
+        seen.target = 0;
+        seen.at = 0;
+        seen.flat = true;
+        seen.hold = false;
+        if (seen.abort) seen.abort.abort();
+        commandData = { code: 200, result: true };
+      } else if (stopNow) {
+        cancelFade(wearer_uuid);
         commandData = await sendToyCommand(wearer_uuid, session.connection, {
           command: 'Function',
           action: 'Stop',
@@ -3970,7 +4189,7 @@ app.post('/api/hud/vibrate', async (req, res) => {
           const command = {
             command: 'Function',
             action: built.action,
-            timeSec: Math.max(1, seconds),
+            timeSec: hold ? 0 : Math.max(1, seconds),
             apiVer: 1,
             stopPrevious: 1
           };
@@ -4003,7 +4222,7 @@ app.post('/api/hud/vibrate', async (req, res) => {
         scaledLevel('Thrusting', levelMap.Thrusting || 0),
         1
       );
-      await db.query(
+      db.query(
         `UPDATE active_sessions
          SET vibe_strength = $2,
              vibe_until = CASE
@@ -4011,8 +4230,8 @@ app.post('/api/hud/vibrate', async (req, res) => {
                ELSE NOW() + ($3 * INTERVAL '1 second')
              END
          WHERE sl_uuid = $1`,
-        [wearer_uuid, strengthNow, stopNow ? 0 : Math.max(1, seconds)]
-      );
+        [wearer_uuid, strengthNow, stopNow ? 0 : (hold ? HOLD_DB_SECONDS : Math.max(1, seconds))]
+      ).catch((err) => console.error('Vibe save failed:', err.message));
       let clock = {};
       if (actor.guest && stopNow) clock = await stopGuestClock(actor, wearer_uuid);
       else if (actor.guest) clock = await startGuestClock(actor, wearer_uuid) || {};
@@ -4026,32 +4245,43 @@ app.post('/api/hud/vibrate', async (req, res) => {
     let seconds = parseInt(duration, 10);
     if (Number.isNaN(seconds)) seconds = 0;
     const vibeCap = actor.guest ? Math.max(1, actor.secondsLeft || 60) : 60;
-    seconds = Math.max(0, Math.min(vibeCap, seconds));
     const stopNow = stop === true || stop === 'true';
     const stopping = stopNow || level === 0;
+    const hold = wantsHold(req.body, actor, stopping);
+    if (!hold) seconds = Math.max(0, Math.min(vibeCap, seconds));
     if (actor.guest && !stopping) {
       const limited = limitSeconds(seconds, actor);
       if (limited.error) return res.status(limited.status).json({ error: limited.error });
       seconds = limited.seconds;
     }
 
+    const seen = ensureFollower(wearer_uuid);
+    if (seq && seen.seq && seq < seen.seq) {
+      return res.json({ success: true, ignored: true });
+    }
     let commandData;
-    if (stopNow) {
-      cancelFade(wearer_uuid);
-      commandData = await sendToyCommand(wearer_uuid, session.connection, {
-        command: 'Function',
-        action: 'Stop',
-        timeSec: 0,
-        apiVer: 1,
-        stopPrevious: 1
-      });
+    if (delivered && !stopping) {
+      if (seq) seen.seq = seq;
+      seen.connection = session.connection;
+      seen.toyId = toy_id || seen.toyId;
+      seen.target = level;
+      seen.at = level;
+      seen.flat = true;
+      seen.hold = !!hold;
+      seen.until = hold
+        ? Number.POSITIVE_INFINITY
+        : Date.now() + Math.max(1, seconds) * 1000;
+      if (seen.abort && seen.sending !== level) seen.abort.abort();
+      commandData = { code: 200, result: true };
     } else {
       commandData = await sendSmoothLevel(
         wearer_uuid,
         session.connection,
         toy_id,
         level,
-        Math.max(1, seconds)
+        stopping ? 0 : (hold ? 0 : Math.max(1, seconds)),
+        hold && !stopping,
+        seq
       );
     }
     if (!commandOk(commandData)) {
@@ -4064,9 +4294,9 @@ app.post('/api/hud/vibrate', async (req, res) => {
       });
     }
 
-    const strengthNow = stopNow ? 0 : level;
-    const holdSeconds = strengthNow === 0 ? 0 : Math.max(1, seconds);
-    await db.query(
+    const strengthNow = stopping ? 0 : level;
+    const holdSeconds = strengthNow === 0 ? 0 : (hold ? HOLD_DB_SECONDS : Math.max(1, seconds));
+    db.query(
       `UPDATE active_sessions
        SET vibe_strength = $2,
            vibe_until = CASE
@@ -4075,7 +4305,7 @@ app.post('/api/hud/vibrate', async (req, res) => {
            END
        WHERE sl_uuid = $1`,
       [wearer_uuid, strengthNow, holdSeconds]
-    );
+    ).catch((err) => console.error('Vibe save failed:', err.message));
     let clock = {};
     if (actor.guest && stopping) clock = await stopGuestClock(actor, wearer_uuid);
     else if (actor.guest) clock = await startGuestClock(actor, wearer_uuid) || {};
