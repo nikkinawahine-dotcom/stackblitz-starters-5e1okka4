@@ -1635,6 +1635,27 @@ async function demoGate(uuid) {
   return demoView(await readDemo(uuid));
 }
 
+app.post('/api/hud/demo/claim', async (req, res) => {
+  const uuid = String(req.body.sl_uuid || '');
+  if (!uuid) return res.status(400).json({ error: "Missing avatar." });
+  try {
+    const created = await db.query(
+      `INSERT INTO hud_demos (sl_uuid, demo_expires)
+       VALUES ($1, NOW() + INTERVAL '2 days')
+       ON CONFLICT (sl_uuid) DO NOTHING
+       RETURNING sl_uuid`,
+      [uuid]
+    );
+    if (!created.rows.length) {
+      return res.status(403).json({ error: "You already got a demo." });
+    }
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Demo claim error:", err);
+    res.status(500).json({ error: "Could not give the demo." });
+  }
+});
+
 app.post('/api/hud/demo', async (req, res) => {
   const uuid = String(req.body.sl_uuid || '');
   if (!uuid) return res.status(400).json({ error: "Missing avatar." });
