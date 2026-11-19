@@ -478,6 +478,7 @@ function mergeBattery(base, extra) {
 }
 
 const batteryCache = new Map();
+let statusDbDownUntil = 0;
 
 async function replaceStoredToys(session, toys) {
   if (!session || !session.connection || !toys.length) return;
@@ -1892,6 +1893,15 @@ app.get('/pair/:sl_uuid', (req, res) => {
 });
 
 app.get('/api/hud/status/:sl_uuid', async (req, res) => {
+  if (Date.now() < statusDbDownUntil) {
+    return res.json({
+      status: 'unknown',
+      connected: false,
+      vibe: 0,
+      toys: [],
+      toy_line: 'No toy'
+    });
+  }
   try {
     const session = await getSession(req.params.sl_uuid);
     if (!session) {
@@ -1910,8 +1920,15 @@ app.get('/api/hud/status/:sl_uuid', async (req, res) => {
       hud_mode: hudMode(session.hud_mode)
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Status lookup failed." });
+    statusDbDownUntil = Date.now() + 60000;
+    console.error("HUD status error:", err.message);
+    return res.json({
+      status: 'unknown',
+      connected: false,
+      vibe: 0,
+      toys: [],
+      toy_line: 'No toy'
+    });
   }
 });
 
