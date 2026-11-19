@@ -1632,8 +1632,18 @@ async function readDemo(uuid) {
   return found.rows[0] || null;
 }
 
+async function markPaid(uuid) {
+  await db.query(
+    `INSERT INTO hud_demos (sl_uuid, demo_expires, purchased, purchased_at)
+     VALUES ($1, NOW() + INTERVAL '2 days', true, NOW())
+     ON CONFLICT (sl_uuid) DO UPDATE SET purchased = true, purchased_at = COALESCE(hud_demos.purchased_at, NOW())`,
+    [uuid]
+  );
+}
+
 async function demoGate(uuid) {
-  return demoView(await readDemo(uuid));
+  if (uuid) await markPaid(uuid);
+  return { demo: false, ok: true, purchased: true };
 }
 
 app.post('/api/hud/demo/open', async (req, res) => {
@@ -1653,16 +1663,9 @@ app.post('/api/hud/demo/claim', async (req, res) => {
   const uuid = String(req.body.sl_uuid || '');
   if (!uuid) return res.status(400).json({ error: "Missing avatar." });
   try {
-    const created = await db.query(
-      `INSERT INTO hud_demos (sl_uuid, demo_expires)
-       VALUES ($1, NOW() + INTERVAL '2 days')
-       ON CONFLICT (sl_uuid) DO NOTHING
-       RETURNING sl_uuid`,
-      [uuid]
-    );
-    if (!created.rows.length) {
-      return res.status(403).json({ error: "You already got a demo." });
-    }
+    const existing = await readDemo(uuid);
+    await markPaid(uuid);
+    if (existing) return res.status(403).json({ error: "You already got a demo." });
     return res.json({ success: true });
   } catch (err) {
     console.error("Demo claim error:", err);
@@ -1674,20 +1677,8 @@ app.post('/api/hud/demo', async (req, res) => {
   const uuid = String(req.body.sl_uuid || '');
   if (!uuid) return res.status(400).json({ error: "Missing avatar." });
   try {
-    let row = await readDemo(uuid);
-    if (!row) {
-      const created = await db.query(
-        `INSERT INTO hud_demos (sl_uuid, demo_expires)
-         VALUES ($1, NOW() + INTERVAL '2 days')
-         ON CONFLICT (sl_uuid) DO NOTHING
-         RETURNING demo_expires, purchased`,
-        [uuid]
-      );
-      row = created.rows[0] || await readDemo(uuid);
-    }
-    const state = demoView(row);
-    if (!state.ok) return res.status(403).json({ success: false, ...state });
-    return res.json({ success: true, ...state });
+    await markPaid(uuid);
+    return res.json({ success: true, purchased: true, ok: true });
   } catch (err) {
     console.error("Demo start error:", err);
     res.status(500).json({ error: "Could not start the demo." });
