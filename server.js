@@ -1702,6 +1702,29 @@ app.post('/api/hud/demo/purchase', async (req, res) => {
   }
 });
 
+app.get('/api/hud/owned', async (req, res) => {
+  const uuid = String(req.query.sl_uuid || '').trim().toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(uuid)) {
+    return res.status(400).json({ bought: false });
+  }
+  try {
+    const found = await db.query(
+      `SELECT purchased
+         AND (
+           purchased_at > created_at + INTERVAL '1 minute'
+           OR demo_expires < created_at + INTERVAL '1 day'
+         ) AS bought
+       FROM hud_demos WHERE lower(sl_uuid) = $1`,
+      [uuid]
+    );
+    res.set('Cache-Control', 'no-store');
+    return res.json({ bought: Boolean(found.rows[0] && found.rows[0].bought) });
+  } catch (err) {
+    console.error("Owned check error:", err);
+    res.status(500).json({ bought: false });
+  }
+});
+
 app.post('/api/hud/register', async (req, res) => {
   const { sl_uuid, sl_http_url, sl_name } = req.body;
 
