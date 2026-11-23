@@ -1702,6 +1702,29 @@ app.post('/api/hud/demo/purchase', async (req, res) => {
   }
 });
 
+app.get('/api/hud/owned', async (req, res) => {
+  const uuid = String(req.query.sl_uuid || '').trim().toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(uuid)) {
+    return res.status(400).json({ bought: false });
+  }
+  try {
+    const found = await db.query(
+      `SELECT purchased
+         AND (
+           purchased_at > created_at + INTERVAL '1 minute'
+           OR demo_expires < created_at + INTERVAL '1 day'
+         ) AS bought
+       FROM hud_demos WHERE lower(sl_uuid) = $1`,
+      [uuid]
+    );
+    res.set('Cache-Control', 'no-store');
+    return res.json({ bought: Boolean(found.rows[0] && found.rows[0].bought) });
+  } catch (err) {
+    console.error("Owned check error:", err);
+    res.status(500).json({ bought: false });
+  }
+});
+
 app.post('/api/hud/register', async (req, res) => {
   const { sl_uuid, sl_http_url, sl_name } = req.body;
 
@@ -4193,6 +4216,35 @@ app.get('/guest/:token', async (req, res) => {
   }
 });
 
+async function releaseToyFromOthers(uid, toys) {
+  const ids = new Set((toys || []).map((toy) => String(toy.id || '')).filter(Boolean));
+  if (!ids.size) return;
+  const others = await db.query(
+    `SELECT sl_uuid, sl_http_url, toys
+     FROM active_sessions
+     WHERE status = 'connected' AND sl_uuid <> $1`,
+    [uid]
+  );
+  for (const row of others.rows) {
+    const theirs = listToys(parseConnection(row.toys) || {});
+    if (!theirs.some((toy) => ids.has(String(toy.id || '')))) continue;
+    await db.query(
+      `UPDATE active_sessions
+       SET status = 'disconnected', toys = NULL, vibe_strength = 0, vibe_until = NOW()
+       WHERE sl_uuid = $1`,
+      [row.sl_uuid]
+    );
+    forgetLink(row.sl_uuid);
+    if (row.sl_http_url) {
+      fetch(row.sl_http_url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: 'DISCONNECTED|This toy linked to someone else.'
+      }).catch((err) => console.error('Could not tell the old HUD:', err.message));
+    }
+  }
+}
+
 async function newestPendingUid() {
   const pending = await db.query(
     `SELECT sl_uuid FROM active_sessions
@@ -4223,10 +4275,6 @@ async function uidForToyCallback(body) {
     const sameDevice = sessions.filter((row) => String(row.connection.deviceCode || '') === deviceCode);
     if (sameDevice.length === 1) return sameDevice[0].sl_uuid;
   }
-  const pending = await newestPendingUid();
-  if (pending) return pending;
-  const connected = sessions.filter((row) => row.status === 'connected');
-  if (connected.length === 1) return connected[0].sl_uuid;
   return '';
 }
 
@@ -4272,21 +4320,8 @@ app.post('/api/webhook/lovense', async (req, res) => {
 
     let session = userCheck.rows[0];
     if (!session) {
-      const pending = await newestPendingUid();
-      if (pending && pending !== uid) {
-        const retry = await db.query(
-          'SELECT sl_http_url, lovense_token, status, toys, display_name FROM active_sessions WHERE sl_uuid = $1',
-          [pending]
-        );
-        session = retry.rows[0];
-        if (session) {
-          console.log('Lovense callback matched the open scan', pending);
-          uid = pending;
-        }
-      }
-    }
-    if (!session) {
-      return res.status(404).send("User session not found in database.");
+      console.error('Lovense callback had no matching avatar', uid);
+      return res.sendStatus(200);
     }
     if (session.status === 'disconnected') {
       return res.sendStatus(200);
@@ -4330,6 +4365,8 @@ app.post('/api/webhook/lovense', async (req, res) => {
       session: { ...session, status: 'connected', connection }
     });
     scheduleGetToys({ sl_uuid: uid, status: 'connected', connection }, true);
+
+    await releaseToyFromOthers(uid, listToys(connection));
 
     if (session.sl_http_url && session.status !== 'connected') {
       await fetch(session.sl_http_url, {
