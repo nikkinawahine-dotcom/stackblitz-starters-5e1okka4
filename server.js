@@ -1849,8 +1849,7 @@ app.get('/pair/:sl_uuid', (req, res) => {
 
   const statusUrl = `/api/hud/status/${encodeURIComponent(slUuid)}`;
   const controlUrl = `/control/${encodeURIComponent(slUuid)}`;
-  const qrSrc = `/api/hud/branded-qr/${encodeURIComponent(slUuid)}`;
-  const fallbackSrc = `/api/hud/qr-proxy?url=${encodeURIComponent(String(qr))}`;
+  const qrSrc = `/api/hud/qr-proxy?url=${encodeURIComponent(String(qr))}`;
   res.type('html').send(`<!DOCTYPE html>
 <html>
 <head>
@@ -1876,16 +1875,11 @@ app.get('/pair/:sl_uuid', (req, res) => {
     const qr = document.getElementById("qr");
     const started = Date.now();
     qr.onerror = () => {
-      if (!qr.dataset.fallback) {
-        qr.dataset.fallback = "1";
-        qr.src = ${JSON.stringify(fallbackSrc)};
-        return;
-      }
       statusEl.textContent = "This code expired. Touch Link toy in Second Life and scan the new one.";
     };
     async function poll() {
       try {
-        const r = await fetch(${JSON.stringify(statusUrl)});
+        const r = await fetch(${JSON.stringify(statusUrl)}, { cache: "no-store" });
         const data = await r.json();
         if (data.status === "connected") {
           statusEl.innerHTML = 'Connected! <a href="${controlUrl}">Open toy controls</a>';
@@ -4245,17 +4239,6 @@ async function releaseToyFromOthers(uid, toys) {
   }
 }
 
-async function newestPendingUid() {
-  const pending = await db.query(
-    `SELECT sl_uuid FROM active_sessions
-     WHERE status = 'pending'
-       AND vibe_until > NOW() - INTERVAL '4 hours'
-     ORDER BY vibe_until DESC
-     LIMIT 1`
-  );
-  return pending.rows[0] && pending.rows[0].sl_uuid;
-}
-
 async function uidForToyCallback(body) {
   const domain = body.domain || '';
   const deviceCode = body.deviceCode ? String(body.deviceCode) : '';
@@ -4278,14 +4261,16 @@ async function uidForToyCallback(body) {
   return '';
 }
 
-app.post('/api/webhook/lovense', async (req, res) => {
+app.post('/api/webhook/lovense', express.text({ type: ['text/plain', 'text/*', 'application/octet-stream'] }), async (req, res) => {
   let body = req.body || {};
+  if (Buffer.isBuffer(body)) body = body.toString('utf8');
   if (typeof body === 'string') {
     try { body = JSON.parse(body); } catch (err) { body = {}; }
   }
+  if (Array.isArray(body)) body = body[0] || {};
   const nested = body.data && typeof body.data === 'object' ? body.data : {};
-  let uid = body.uid || body.userId || body.uuid || body.user_id || nested.uid || nested.userId || nested.uuid;
-  const utoken = body.utoken || nested.utoken;
+  let uid = String(body.uid || body.userId || body.uuid || body.user_id || body.UID || nested.uid || nested.userId || nested.uuid || nested.user_id || '').trim();
+  const utoken = body.utoken || body.uToken || nested.utoken || nested.uToken;
   const domain = body.domain || nested.domain;
   const httpPort = body.httpPort || nested.httpPort;
   const httpsPort = body.httpsPort || nested.httpsPort;
@@ -4297,35 +4282,35 @@ app.post('/api/webhook/lovense', async (req, res) => {
   if (!body.toyList && nested.toyList) body = { ...nested, ...body };
 
   try {
-    if (!uid && utoken) {
+    if (utoken) {
       const byToken = await db.query(
-        'SELECT sl_uuid FROM active_sessions WHERE lovense_token = $1',
+        `SELECT sl_uuid FROM active_sessions
+         WHERE lovense_token = $1 AND status IN ('pending', 'connected')`,
         [utoken]
       );
-      uid = byToken.rows[0] && byToken.rows[0].sl_uuid;
+      if (byToken.rows[0]) uid = byToken.rows[0].sl_uuid;
     }
-    if (!uid && (body.toyList || body.deviceCode || body.domain)) {
+    if (!uid && (body.toyList || body.toys || body.deviceCode || body.domain || nested.domain)) {
       uid = await uidForToyCallback(body);
       if (uid) console.log('Lovense callback matched a saved link');
     }
     if (!uid) {
       console.error('Lovense callback missing uid', Object.keys(body));
-      return res.status(400).send('Missing uid.');
+      return res.sendStatus(200);
     }
 
     const userCheck = await db.query(
-      'SELECT sl_http_url, lovense_token, status, toys, display_name FROM active_sessions WHERE sl_uuid = $1',
+      `SELECT sl_uuid, sl_http_url, lovense_token, status, toys, display_name
+       FROM active_sessions WHERE lower(sl_uuid) = lower($1)`,
       [uid]
     );
 
     let session = userCheck.rows[0];
-    if (!session) {
-      console.error('Lovense callback had no matching avatar', uid);
+    if (!session || session.status === 'disconnected') {
+      console.error('Lovense callback had no open scan', uid);
       return res.sendStatus(200);
     }
-    if (session.status === 'disconnected') {
-      return res.sendStatus(200);
-    }
+    uid = session.sl_uuid;
     if (utoken && session.lovense_token && utoken !== session.lovense_token) {
       console.log('Lovense utoken changed for', uid);
     }
