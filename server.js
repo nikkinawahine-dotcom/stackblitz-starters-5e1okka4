@@ -115,6 +115,7 @@ async function ensureSchema() {
   await db.query(`ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS vibe_strength INTEGER DEFAULT 0`);
   await db.query(`ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS vibe_until TIMESTAMPTZ`);
   await db.query(`ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS hud_mode TEXT DEFAULT 'normal'`);
+  await db.query(`ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS phone_domain TEXT`);
   await db.query(`CREATE TABLE IF NOT EXISTS saved_patterns (
     id BIGSERIAL PRIMARY KEY,
     sl_uuid TEXT NOT NULL,
@@ -1849,7 +1850,8 @@ app.get('/pair/:sl_uuid', (req, res) => {
 
   const statusUrl = `/api/hud/status/${encodeURIComponent(slUuid)}`;
   const controlUrl = `/control/${encodeURIComponent(slUuid)}`;
-  const qrSrc = `/api/hud/qr-proxy?url=${encodeURIComponent(String(qr))}`;
+  const qrSrc = `/api/hud/branded-qr/${encodeURIComponent(slUuid)}`;
+  const fallbackSrc = `/api/hud/qr-proxy?url=${encodeURIComponent(String(qr))}`;
   res.type('html').send(`<!DOCTYPE html>
 <html>
 <head>
@@ -1875,6 +1877,11 @@ app.get('/pair/:sl_uuid', (req, res) => {
     const qr = document.getElementById("qr");
     const started = Date.now();
     qr.onerror = () => {
+      if (!qr.dataset.fallback) {
+        qr.dataset.fallback = "1";
+        qr.src = ${JSON.stringify(fallbackSrc)};
+        return;
+      }
       statusEl.textContent = "This code expired. Touch Link toy in Second Life and scan the new one.";
     };
     async function poll() {
@@ -4239,6 +4246,17 @@ async function releaseToyFromOthers(uid, toys) {
   }
 }
 
+async function openScanUid() {
+  const pending = await db.query(
+    `SELECT sl_uuid FROM active_sessions
+     WHERE status = 'pending'
+       AND vibe_until > NOW() - INTERVAL '15 minutes'
+     ORDER BY vibe_until DESC`
+  );
+  if (pending.rows.length !== 1) return '';
+  return pending.rows[0].sl_uuid;
+}
+
 async function uidForToyCallback(body) {
   const domain = body.domain || '';
   const deviceCode = body.deviceCode ? String(body.deviceCode) : '';
@@ -4290,9 +4308,27 @@ app.post('/api/webhook/lovense', express.text({ type: ['text/plain', 'text/*', '
       );
       if (byToken.rows[0]) uid = byToken.rows[0].sl_uuid;
     }
+    if (!uid && domain) {
+      const owner = await db.query(
+        `SELECT sl_uuid, status FROM active_sessions WHERE phone_domain = $1`,
+        [domain]
+      );
+      if (owner.rows.length === 1) {
+        if (owner.rows[0].status === 'disconnected') {
+          console.log('Lovense callback ignored for a closed phone');
+          return res.sendStatus(200);
+        }
+        uid = owner.rows[0].sl_uuid;
+        console.log('Lovense callback matched a saved link');
+      }
+    }
     if (!uid && (body.toyList || body.toys || body.deviceCode || body.domain || nested.domain)) {
       uid = await uidForToyCallback(body);
       if (uid) console.log('Lovense callback matched a saved link');
+    }
+    if (!uid && domain) {
+      uid = await openScanUid();
+      if (uid) console.log('Lovense scan completed for the open code');
     }
     if (!uid) {
       console.error('Lovense callback missing uid', Object.keys(body));
@@ -4337,11 +4373,18 @@ app.post('/api/webhook/lovense', express.text({ type: ['text/plain', 'text/*', '
       batteryCache.set(uid, { at: Date.now(), toys: listToys(connection) });
     }
 
+    if (domain) {
+      await db.query(
+        `UPDATE active_sessions SET phone_domain = NULL WHERE phone_domain = $1 AND sl_uuid <> $2`,
+        [domain, uid]
+      );
+    }
     await db.query(
       `UPDATE active_sessions
-       SET status = 'connected', toys = $1, lovense_token = COALESCE($3, lovense_token)
+       SET status = 'connected', toys = $1, lovense_token = COALESCE($3, lovense_token),
+           phone_domain = COALESCE($4, phone_domain)
        WHERE sl_uuid = $2`,
-      [JSON.stringify(connection), uid, utoken || null]
+      [JSON.stringify(connection), uid, utoken || null, domain || null]
     );
 
     getToysAt.delete(uid);
