@@ -1870,6 +1870,7 @@ app.get('/pair/:sl_uuid', (req, res) => {
   <img class="logo" src="/logo.png" alt="Mālama Hōkū">
   <h1>Mālama Hōkū</h1>
   <p>Open Lovense Remote, use Scan QR, then wait until this page says connected.</p>
+  <p>Using another avatar? Disconnect your toy from the in-world HUD first. If you do not, this avatar will not connect.</p>
   <img id="qr" src="${qrSrc}" alt="Lovense QR code">
   <p id="status">Waiting for scan…</p>
   <script>
@@ -4315,11 +4316,17 @@ app.post('/api/webhook/lovense', express.text({ type: ['text/plain', 'text/*', '
       );
       if (owner.rows.length === 1) {
         if (owner.rows[0].status === 'disconnected') {
-          console.log('Lovense callback ignored for a closed phone');
-          return res.sendStatus(200);
+          const waiting = await openScanUid();
+          if (!waiting) {
+            console.log('Lovense callback ignored for a closed phone');
+            return res.sendStatus(200);
+          }
+          uid = waiting;
+          console.log('Lovense scan moved after a HUD disconnect');
+        } else {
+          uid = owner.rows[0].sl_uuid;
+          console.log('Lovense callback matched a saved link');
         }
-        uid = owner.rows[0].sl_uuid;
-        console.log('Lovense callback matched a saved link');
       }
     }
     if (!uid && (body.toyList || body.toys || body.deviceCode || body.domain || nested.domain)) {
